@@ -481,6 +481,166 @@ describe('registerTools', () => {
     });
   });
 
+  describe('get_milestones (customerKeyword / opportunityKeyword / includeTasks)', () => {
+    const makeMilestone = (name, status, oppName, wlName, msId = 'ms-1') => ({
+      msp_engagementmilestoneid: msId,
+      msp_milestonenumber: '7-100',
+      msp_name: name,
+      msp_milestonedate: '2026-06-01',
+      msp_monthlyuse: 1000,
+      'msp_milestonestatus@OData.Community.Display.V1.FormattedValue': status,
+      '_msp_opportunityid_value@OData.Community.Display.V1.FormattedValue': oppName,
+      '_msp_workloadlkid_value@OData.Community.Display.V1.FormattedValue': wlName,
+      'msp_milestonecategory@OData.Community.Display.V1.FormattedValue': 'PoC/Pilot'
+    });
+
+    it('customerKeyword resolves customer → accounts → opportunities → milestones in one tool call', async () => {
+      // 1. accounts query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { accountid: 'acct-1', name: 'Contoso Ltd' }
+        ] }
+      });
+      // 2. opportunities query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { opportunityid: '11111111-1111-1111-1111-111111111111', name: 'Contoso AI' }
+        ] }
+      });
+      // 3. milestones query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          makeMilestone('Deploy Copilot', 'In Progress', 'Contoso AI', 'Azure')
+        ] }
+      });
+      const result = await callTool(server, 'get_milestones', { customerKeyword: 'Contoso' });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.count).toBe(1);
+      expect(parsed.milestones[0].msp_name).toBe('Deploy Copilot');
+      // Verify accounts query
+      expect(crm.requestAllPages).toHaveBeenCalledWith('accounts', expect.objectContaining({
+        query: expect.objectContaining({ $filter: "contains(name,'Contoso')" })
+      }));
+    });
+
+    it('customerKeyword returns message when no accounts found', async () => {
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [] }
+      });
+      const result = await callTool(server, 'get_milestones', { customerKeyword: 'NonExistent' });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.count).toBe(0);
+      expect(parsed.message).toContain('No accounts found');
+    });
+
+    it('customerKeyword returns message when no opportunities found', async () => {
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [{ accountid: 'acct-1', name: 'Contoso' }] }
+      });
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [] }
+      });
+      const result = await callTool(server, 'get_milestones', { customerKeyword: 'Contoso' });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.count).toBe(0);
+      expect(parsed.message).toContain('No active opportunities');
+    });
+
+    it('opportunityKeyword resolves opportunity name → milestones in one tool call', async () => {
+      // 1. opportunities query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { opportunityid: '11111111-1111-1111-1111-111111111111', name: 'Azure Migration' }
+        ] }
+      });
+      // 2. milestones query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          makeMilestone('Migrate DB', 'Not Started', 'Azure Migration', 'Azure SQL')
+        ] }
+      });
+      const result = await callTool(server, 'get_milestones', { opportunityKeyword: 'Azure Migration' });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.count).toBe(1);
+      expect(parsed.milestones[0].msp_name).toBe('Migrate DB');
+    });
+
+    it('opportunityKeyword returns message when no opportunities found', async () => {
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [] }
+      });
+      const result = await callTool(server, 'get_milestones', { opportunityKeyword: 'NonExistent' });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.count).toBe(0);
+      expect(parsed.message).toContain('No active opportunities');
+    });
+
+    it('includeTasks embeds linked tasks inline on each milestone', async () => {
+      const ms1Id = '11111111-1111-1111-1111-111111111111';
+      const ms2Id = '22222222-2222-2222-2222-222222222222';
+      // milestones query
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          makeMilestone('MS-A', 'In Progress', 'Opp1', 'Azure', ms1Id),
+          makeMilestone('MS-B', 'Not Started', 'Opp1', 'Azure', ms2Id)
+        ] }
+      });
+      // tasks query (for includeTasks)
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { activityid: 'task-1', subject: 'Review arch', _regardingobjectid_value: ms1Id },
+          { activityid: 'task-2', subject: 'Deploy POC', _regardingobjectid_value: ms1Id }
+        ] }
+      });
+      const result = await callTool(server, 'get_milestones', { includeTasks: true });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.milestones[0].tasks).toHaveLength(2);
+      expect(parsed.milestones[0].tasks[0].subject).toBe('Review arch');
+      expect(parsed.milestones[1].tasks).toHaveLength(0);
+    });
+
+    it('customerKeyword + statusFilter + includeTasks combines all features', async () => {
+      const ms1Id = '11111111-1111-1111-1111-111111111111';
+      // accounts
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [{ accountid: 'acct-1', name: 'Contoso' }] }
+      });
+      // opportunities
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { opportunityid: '11111111-1111-1111-1111-111111111111', name: 'Contoso AI' }
+        ] }
+      });
+      // milestones
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          makeMilestone('Active MS', 'In Progress', 'Contoso AI', 'Azure', ms1Id),
+          makeMilestone('Done MS', 'Completed', 'Contoso AI', 'Azure', '33333333-3333-3333-3333-333333333333')
+        ] }
+      });
+      // tasks (for includeTasks)
+      crm.requestAllPages.mockResolvedValueOnce({
+        ok: true, status: 200, data: { value: [
+          { activityid: 'task-1', subject: 'Task A', _regardingobjectid_value: ms1Id }
+        ] }
+      });
+      const result = await callTool(server, 'get_milestones', {
+        customerKeyword: 'Contoso',
+        statusFilter: 'active',
+        includeTasks: true
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      // statusFilter should exclude Completed
+      expect(parsed.count).toBe(1);
+      expect(parsed.milestones[0].msp_name).toBe('Active MS');
+      expect(parsed.milestones[0].tasks).toHaveLength(1);
+    });
+  });
+
   describe('get_milestone_activities (batch)', () => {
     it('supports batch milestoneIds array', async () => {
       crm.requestAllPages.mockResolvedValueOnce({

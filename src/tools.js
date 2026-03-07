@@ -119,6 +119,41 @@ async function applyTaskFilter(crmClient, milestones, mode) {
   return milestones.filter(m => taskMatches.has(m.msp_engagementmilestoneid));
 }
 
+const INLINE_TASK_SELECT = 'activityid,subject,scheduledend,statuscode,statecode,_ownerid_value,description,msp_taskcategory,_regardingobjectid_value';
+
+/** Fetch tasks for a list of milestone IDs and return them as a flat array. */
+async function fetchTasksForMilestones(crmClient, msIds) {
+  if (!msIds.length) return [];
+  const chunks = [];
+  for (let i = 0; i < msIds.length; i += 25) chunks.push(msIds.slice(i, i + 25));
+  const allTasks = [];
+  for (const chunk of chunks) {
+    const tf = chunk.map(id => `_regardingobjectid_value eq '${id}'`).join(' or ');
+    const taskResult = await crmClient.requestAllPages('tasks', {
+      query: { $filter: tf, $select: INLINE_TASK_SELECT, $orderby: 'createdon desc' }
+    });
+    if (taskResult.ok && taskResult.data?.value) allTasks.push(...taskResult.data.value);
+  }
+  return allTasks;
+}
+
+/** Batch-fetch tasks and embed them as a `tasks` array on each milestone record. */
+async function embedTasksOnMilestones(crmClient, milestones) {
+  if (!milestones.length) return milestones;
+  const msIds = milestones.map(m => m.msp_engagementmilestoneid).filter(Boolean);
+  const allTasks = await fetchTasksForMilestones(crmClient, msIds);
+  const byMilestone = {};
+  for (const t of allTasks) {
+    const msId = t._regardingobjectid_value;
+    if (!byMilestone[msId]) byMilestone[msId] = [];
+    byMilestone[msId].push(t);
+  }
+  return milestones.map(m => ({
+    ...m,
+    tasks: byMilestone[m.msp_engagementmilestoneid] || []
+  }));
+}
+
 /**
  * Register all CRM tools on an McpServer instance.
  */
@@ -235,8 +270,10 @@ export function registerTools(server, crmClient) {
   // ── get_milestones ──────────────────────────────────────────
   server.tool(
     'get_milestones',
-    'Get engagement milestones by milestoneId, milestone number, opportunity, or owner. Supports batch opportunityIds, status/keyword filtering, and task-presence filtering.',
+    'Get engagement milestones by customer name, opportunity name/GUID, milestoneId, milestone number, or owner. Resolves customer/opportunity keywords to GUIDs internally — no need to call list_opportunities first. Supports batch opportunityIds, status/keyword filtering, task-presence filtering, and inline task embedding.',
     {
+      customerKeyword: z.string().optional().describe('Customer name keyword — resolves accounts → opportunities → milestones in one call'),
+      opportunityKeyword: z.string().optional().describe('Opportunity name keyword — resolves matching opportunities → milestones in one call'),
       opportunityId: z.string().optional().describe('Opportunity GUID to list milestones for'),
       opportunityIds: z.array(z.string()).optional().describe('Array of opportunity GUIDs for batch milestone retrieval'),
       milestoneNumber: z.string().optional().describe('Milestone number to search for, e.g. "7-123456789"'),
@@ -246,9 +283,10 @@ export function registerTools(server, crmClient) {
       statusFilter: z.enum(['active', 'all']).optional().describe('Filter by status: active = Not Started/In Progress/Blocked/At Risk'),
       keyword: z.string().optional().describe('Case-insensitive keyword filter across milestone name, opportunity, and workload'),
       format: z.enum(['full', 'summary']).optional().describe('Response format: full (default) or summary (grouped compact output)'),
-      taskFilter: z.enum(['all', 'with-tasks', 'without-tasks']).optional().describe('Filter milestones by task presence')
+      taskFilter: z.enum(['all', 'with-tasks', 'without-tasks']).optional().describe('Filter milestones by task presence'),
+      includeTasks: z.boolean().optional().describe('When true, embeds linked tasks inline on each milestone (avoids separate get_milestone_activities call). Default: false')
     },
-    async ({ opportunityId, opportunityIds, milestoneNumber, milestoneId, ownerId, mine, statusFilter, keyword, format, taskFilter: taskFilterParam }) => {
+    async ({ customerKeyword, opportunityKeyword, opportunityId, opportunityIds, milestoneNumber, milestoneId, ownerId, mine, statusFilter, keyword, format, taskFilter: taskFilterParam, includeTasks }) => {
       // Direct GUID lookup
       if (milestoneId) {
         const nid = normalizeGuid(milestoneId);
@@ -257,7 +295,68 @@ export function registerTools(server, crmClient) {
           query: { $select: MILESTONE_SELECT }
         });
         if (!result.ok) return error(`Milestone lookup failed (${result.status}): ${result.data?.message}`);
-        return text({ ...result.data, commitment: commitmentLabel(result.data) });
+        const milestone = { ...result.data, commitment: commitmentLabel(result.data) };
+        if (includeTasks) {
+          milestone.tasks = await fetchTasksForMilestones(crmClient, [nid]);
+        }
+        return text(milestone);
+      }
+
+      // Resolve customerKeyword → opportunity GUIDs
+      let resolvedOppIds = null;
+      if (customerKeyword) {
+        const sanitized = sanitizeODataString(customerKeyword.trim());
+        const acctResult = await crmClient.requestAllPages('accounts', {
+          query: { $filter: `contains(name,'${sanitized}')`, $select: 'accountid,name', $top: '50' }
+        });
+        const accounts = acctResult.ok ? (acctResult.data?.value || []) : [];
+        if (!accounts.length) {
+          return text({ count: 0, milestones: [], message: `No accounts found matching '${customerKeyword}'` });
+        }
+        const acctIds = accounts.map(a => a.accountid);
+        const cutoff = daysAgo(30);
+        const acctChunks = [];
+        for (let i = 0; i < acctIds.length; i += 25) acctChunks.push(acctIds.slice(i, i + 25));
+        const allOpps = [];
+        for (const chunk of acctChunks) {
+          const acctFilter = `(${chunk.map(id => `_parentaccountid_value eq '${id}'`).join(' or ')}) and statecode eq 0 and msp_estcompletiondate ge ${cutoff}`;
+          const oppResult = await crmClient.requestAllPages('opportunities', {
+            query: { $filter: acctFilter, $select: 'opportunityid,name', $orderby: 'name' }
+          });
+          if (oppResult.ok && oppResult.data?.value) allOpps.push(...oppResult.data.value);
+        }
+        if (!allOpps.length) {
+          return text({ count: 0, milestones: [], message: `No active opportunities found for customer '${customerKeyword}'` });
+        }
+        resolvedOppIds = allOpps.map(o => o.opportunityid);
+      }
+
+      // Resolve opportunityKeyword → opportunity GUIDs
+      if (!resolvedOppIds && opportunityKeyword) {
+        const sanitized = sanitizeODataString(opportunityKeyword.trim());
+        const cutoff = daysAgo(30);
+        const oppResult = await crmClient.requestAllPages('opportunities', {
+          query: {
+            $filter: `contains(name,'${sanitized}') and statecode eq 0 and msp_estcompletiondate ge ${cutoff}`,
+            $select: 'opportunityid,name',
+            $orderby: 'name',
+            $top: '50'
+          }
+        });
+        const opps = oppResult.ok ? (oppResult.data?.value || []) : [];
+        if (!opps.length) {
+          return text({ count: 0, milestones: [], message: `No active opportunities found matching '${opportunityKeyword}'` });
+        }
+        resolvedOppIds = opps.map(o => o.opportunityid);
+      }
+
+      // If keyword resolution produced opportunity IDs, merge with explicit opportunityIds
+      if (resolvedOppIds) {
+        const merged = resolvedOppIds;
+        if (opportunityIds?.length) merged.push(...opportunityIds);
+        if (opportunityId) merged.push(opportunityId);
+        opportunityIds = merged;
+        opportunityId = undefined;
       }
 
       let filter;
@@ -292,6 +391,9 @@ export function registerTools(server, crmClient) {
         if (taskFilterParam && taskFilterParam !== 'all') {
           milestones = await applyTaskFilter(crmClient, milestones, taskFilterParam);
         }
+        if (includeTasks) {
+          milestones = await embedTasksOnMilestones(crmClient, milestones);
+        }
         if (format === 'summary') return text(buildMilestoneSummary(milestones));
         return text({ count: milestones.length, milestones: milestones.map(m => ({ ...m, commitment: commitmentLabel(m) })) });
       } else if (opportunityId) {
@@ -310,7 +412,7 @@ export function registerTools(server, crmClient) {
         const nid = normalizeGuid(whoAmI.data.UserId);
         filter = `_ownerid_value eq '${nid}'`;
       } else {
-        return error('Provide opportunityId, milestoneNumber, milestoneId, ownerId, or set mine=true');
+        return error('Provide customerKeyword, opportunityKeyword, opportunityId, milestoneNumber, milestoneId, ownerId, or set mine=true');
       }
 
       const result = await crmClient.requestAllPages('msp_engagementmilestones', {
@@ -333,6 +435,9 @@ export function registerTools(server, crmClient) {
       }
       if (taskFilterParam && taskFilterParam !== 'all') {
         milestones = await applyTaskFilter(crmClient, milestones, taskFilterParam);
+      }
+      if (includeTasks) {
+        milestones = await embedTasksOnMilestones(crmClient, milestones);
       }
       if (format === 'summary') return text(buildMilestoneSummary(milestones));
       return text({ count: milestones.length, milestones: milestones.map(m => ({ ...m, commitment: commitmentLabel(m) })) });
