@@ -72,7 +72,7 @@ function daysAgo(days) {
   return d.toISOString().split('T')[0];
 }
 
-const ACTIVE_STATUSES = new Set(['Not Started', 'In Progress', 'Blocked', 'At Risk']);
+const ACTIVE_STATUSES = new Set(['Not Started', 'On Track', 'In Progress', 'Blocked', 'At Risk']);
 
 /** Derive human-readable commitment label from a milestone record. */
 function commitmentLabel(m) {
@@ -290,7 +290,7 @@ export function registerTools(server, crmClient) {
       milestoneId: z.string().optional().describe('Direct milestone GUID lookup'),
       ownerId: z.string().optional().describe('Owner system user GUID to list milestones for'),
       mine: z.boolean().optional().describe('When true (default), returns milestones owned by the authenticated CRM user if no other filter is provided'),
-      statusFilter: z.enum(['active', 'all']).optional().describe('Filter by status: active = Not Started/In Progress/Blocked/At Risk'),
+      statusFilter: z.enum(['active', 'all']).optional().describe('Filter by status: active = Not Started/On Track/Blocked/At Risk'),
       keyword: z.string().optional().describe('Case-insensitive keyword filter across milestone name, opportunity, and workload'),
       format: z.enum(['full', 'summary']).optional().describe('Response format: full (default) or summary (grouped compact output)'),
       taskFilter: z.enum(['all', 'with-tasks', 'without-tasks']).optional().describe('Filter milestones by task presence'),
