@@ -160,13 +160,23 @@ export function createCrmClient(authService) {
 
   /**
    * Execute a request and auto-paginate if @odata.nextLink is present.
+   * @param {string} entityPath
+   * @param {object} opts
+   * @param {number} [opts.maxRecords] - Hard ceiling on total records collected across pages. 0 = unlimited.
    */
   const requestAllPages = async (entityPath, opts = {}) => {
+    const maxRecords = opts.maxRecords || 0; // 0 = no cap (caller-controlled)
     const first = await request(entityPath, opts);
     if (!first.ok || !first.data?.value) return first;
 
     const allValues = [...first.data.value];
     let nextLink = first.data['@odata.nextLink'];
+
+    // Respect ceiling
+    if (maxRecords > 0 && allValues.length >= maxRecords) {
+      allValues.length = maxRecords;
+      return { ok: true, status: 200, data: { ...first.data, value: allValues, truncated: true } };
+    }
 
     while (nextLink) {
       const authResult = await authService.ensureAuth();
@@ -194,6 +204,11 @@ export function createCrmClient(authService) {
         if (!resp.ok) break;
         const page = await resp.json();
         if (page?.value) allValues.push(...page.value);
+        // Enforce ceiling mid-pagination
+        if (maxRecords > 0 && allValues.length >= maxRecords) {
+          allValues.length = maxRecords;
+          return { ok: true, status: 200, data: { ...first.data, value: allValues, truncated: true } };
+        }
         nextLink = page['@odata.nextLink'];
       } catch {
         break;

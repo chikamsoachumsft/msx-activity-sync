@@ -4,6 +4,38 @@
 import { z } from 'zod';
 import { isValidGuid, normalizeGuid, isValidTpid, sanitizeODataString } from './validation.js';
 import { getApprovalQueue } from './approval-queue.js';
+import { auditLog } from './audit.js';
+
+// ── Entity allowlist ─────────────────────────────────────────
+// Only these Dynamics 365 entity sets may be queried via crm_query
+// and crm_get_record.  Purpose-built tools bypass this list because
+// they already constrain scope through hard-coded entity paths.
+export const ALLOWED_ENTITY_SETS = new Set([
+  'accounts',
+  'contacts',
+  'opportunities',
+  'msp_engagementmilestones',
+  'msp_dealteams',
+  'msp_workloads',
+  'tasks',
+  'systemusers',
+  'transactioncurrencies',
+  // Deal team / partner linkage (alternative to msp_dealteams in some orgs)
+  'connections',
+  'connectionroles',
+  // BPF stage name resolution (mcem-stage-identification)
+  'processstages',
+  // Metadata endpoints (used by get_task_status_options pattern)
+  'EntityDefinitions',
+]);
+
+/** Check whether an entity set (or entity-set-with-key) is on the allowlist. */
+export function isEntityAllowed(entitySet) {
+  if (!entitySet || typeof entitySet !== 'string') return false;
+  // Strip key suffix: "accounts(guid)" → "accounts"
+  const base = entitySet.split('(')[0].split('/')[0];
+  return ALLOWED_ENTITY_SETS.has(base);
+}
 
 const MILESTONE_SELECT = [
   'msp_engagementmilestoneid',
@@ -18,7 +50,11 @@ const MILESTONE_SELECT = [
   '_ownerid_value',
   '_msp_opportunityid_value',
   'msp_forecastcommentsjsonfield',
-  'msp_forecastcomments'
+  'msp_forecastcomments',
+  'msp_milestoneworkload',
+  'msp_deliveryspecifiedfield',
+  'msp_milestonepreferredazureregion',
+  'msp_milestoneazurecapacitytype'
 ].join(',');
 
 const OPP_SELECT = [
@@ -37,6 +73,118 @@ const TASK_CATEGORIES = [
   { label: 'PoC/Pilot', value: 861980005 },
   { label: 'Workshop', value: 861980001 }
 ];
+
+// ── Milestone view field picklist options ─────────────────────
+// Embedded here so the agent can present options to users without
+// a metadata round-trip.  get_milestone_field_options still queries
+// live metadata for the full list (especially Azure regions/capacity).
+
+const WORKLOAD_TYPES = [
+  { label: 'Azure', value: 861980000 },
+  { label: 'Dynamics 365', value: 861980001 },
+  { label: 'Security', value: 861980002 },
+  { label: 'Modern Work', value: 861980003 }
+];
+
+const DELIVERED_BY = [
+  { label: 'Customer', value: 606820000 },
+  { label: 'Partner', value: 606820001 },
+  { label: 'ISD', value: 606820002 },
+  { label: 'Microsoft Support', value: 606820003 }
+];
+
+const MILESTONE_STATUSES = [
+  { label: 'On Track', value: 861980000 },
+  { label: 'At Risk', value: 861980001 },
+  { label: 'Blocked', value: 861980002 },
+  { label: 'Completed', value: 861980003 },
+  { label: 'Cancelled', value: 861980004 },
+  { label: 'Not Started', value: 861980005 },
+  { label: 'Closed as Incomplete', value: 861980007 }
+];
+
+const COMMITMENT_RECOMMENDATIONS = [
+  { label: 'Uncommitted', value: 861980000 },
+  { label: 'Committed', value: 861980001 },
+  { label: 'Best Case', value: 861980002 },
+  { label: 'Pipeline', value: 861980003 }
+];
+
+const MILESTONE_CATEGORIES = [
+  { label: 'POC/Pilot', value: 861980000 },
+  { label: 'Pre-Production', value: 861980001 },
+  { label: 'Production', value: 861980002 }
+];
+
+// Common regions — full list (75 options) available via get_milestone_field_options
+const PREFERRED_AZURE_REGIONS_COMMON = [
+  { label: 'East US - Blue Ridge', value: 861980005 },
+  { label: 'East US 2 - Boydton', value: 861980006 },
+  { label: 'Central US - Des Moines', value: 861980018 },
+  { label: 'West US 2 - Quincy', value: 861980040 },
+  { label: 'West US 3 - Phoenix', value: 861980036 },
+  { label: 'West Europe - Amsterdam', value: 861980001 },
+  { label: 'North Europe - Dublin', value: 861980022 },
+  { label: 'Southeast Asia - Singapore', value: 861980046 },
+  { label: 'None', value: 861980076 }
+];
+
+// Common capacity types — full list (65 options) available via get_milestone_field_options
+// NOTE: This is a MultiSelectPicklist — values are comma-separated strings (e.g. "861980081,861980065")
+const AZURE_CAPACITY_TYPES_COMMON = [
+  { label: 'None', value: 861980000 },
+  { label: 'Av2/Dv2/Dv3/Ev3/Dsv3/Esv3 (Intel) (Cores)', value: 861980037 },
+  { label: 'Azure SQL Database (Cores or DTUs)', value: 861980065 },
+  { label: 'Azure OpenAI Service', value: 861980081 },
+  { label: 'Nd H100 V5 (Cores) (Future)', value: 861980080 },
+  { label: 'Other', value: 861980032 }
+];
+
+/** Resolve a picklist numeric value to "Label (value)" for human-readable output.
+ *  For multi-select (comma-separated codes), resolves each code individually. */
+function resolvePicklistLabel(options, value) {
+  if (value === undefined || value === null) return null;
+  // Multi-select: comma-separated string of codes
+  if (typeof value === 'string' && value.includes(',')) {
+    return value.split(',').map(code => {
+      const num = Number(code.trim());
+      const match = options.find(o => o.value === num);
+      return match ? `${match.label} (${num})` : String(num);
+    }).join(', ');
+  }
+  const num = typeof value === 'string' ? Number(value) : value;
+  const match = options.find(o => o.value === num);
+  return match ? `${match.label} (${num})` : String(num);
+}
+
+/** Map of CRM payload keys to their picklist arrays for resolution. */
+const PICKLIST_MAP = {
+  msp_milestoneworkload: WORKLOAD_TYPES,
+  msp_deliveryspecifiedfield: DELIVERED_BY,
+  msp_milestonepreferredazureregion: PREFERRED_AZURE_REGIONS_COMMON,
+  msp_milestoneazurecapacitytype: AZURE_CAPACITY_TYPES_COMMON,
+  msp_milestonestatus: MILESTONE_STATUSES,
+  msp_commitmentrecommendation: COMMITMENT_RECOMMENDATIONS,
+  msp_milestonecategory: MILESTONE_CATEGORIES
+};
+
+/** Resolve all picklist fields in a payload to human-readable labels.
+ *  Non-picklist and lookup fields are passed through as-is. */
+function resolvePayloadLabels(payload) {
+  const resolved = {};
+  for (const [key, value] of Object.entries(payload)) {
+    const picklist = PICKLIST_MAP[key];
+    if (picklist && value !== undefined && value !== null) {
+      resolved[key] = resolvePicklistLabel(picklist, value);
+    } else {
+      resolved[key] = value;
+    }
+  }
+  return resolved;
+}
+
+/** Maximum records crm_query will return via auto-pagination. */
+export const CRM_QUERY_MAX_RECORDS = 500;
 
 const text = (content) => ({ content: [{ type: 'text', text: typeof content === 'string' ? content : JSON.stringify(content, null, 2) }] });
 const error = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
@@ -183,7 +331,7 @@ export function registerTools(server, crmClient) {
   // ── crm_query ───────────────────────────────────────────────
   server.tool(
     'crm_query',
-    'Execute a read-only OData GET against any Dynamics 365 entity set. Supports $filter, $select, $orderby, $top, $expand. Auto-paginates results.',
+    `Execute a read-only OData GET against an allowed Dynamics 365 entity set. Supports $filter, $select, $orderby, $top, $expand. Auto-paginates up to ${CRM_QUERY_MAX_RECORDS} records. Allowed entity sets: ${[...ALLOWED_ENTITY_SETS].join(', ')}.`,
     {
       entitySet: z.string().describe('Entity set name, e.g. "opportunities", "accounts", "msp_engagementmilestones"'),
       filter: z.string().optional().describe('OData $filter expression'),
@@ -194,17 +342,28 @@ export function registerTools(server, crmClient) {
     },
     async ({ entitySet, filter, select, orderby, top, expand }) => {
       if (!entitySet) return error('entitySet is required');
+
+      if (!isEntityAllowed(entitySet)) {
+        auditLog({ tool: 'crm_query', entitySet, blocked: true, reason: 'entity not in allowlist' });
+        return error(
+          `Entity set "${entitySet}" is not in the allowed list. ` +
+          `Permitted entity sets: ${[...ALLOWED_ENTITY_SETS].join(', ')}. ` +
+          `If you need access to this entity, add it to ALLOWED_ENTITY_SETS in tools.js.`
+        );
+      }
+
       const query = {};
       if (filter) query.$filter = filter;
       if (select) query.$select = select;
       if (orderby) query.$orderby = orderby;
-      if (top) query.$top = String(top);
+      if (top) query.$top = String(Math.min(top, CRM_QUERY_MAX_RECORDS));
       if (expand) query.$expand = expand;
 
-      const result = await crmClient.requestAllPages(entitySet, { query });
+      const result = await crmClient.requestAllPages(entitySet, { query, maxRecords: CRM_QUERY_MAX_RECORDS });
       if (!result.ok) return error(`Query failed (${result.status}): ${result.data?.message}`);
 
       const records = result.data?.value || (result.data ? [result.data] : []);
+      auditLog({ tool: 'crm_query', entitySet, params: { filter, select, top }, recordCount: records.length });
       return text({ count: records.length, value: records });
     }
   );
@@ -212,7 +371,7 @@ export function registerTools(server, crmClient) {
   // ── crm_get_record ──────────────────────────────────────────
   server.tool(
     'crm_get_record',
-    'Retrieve a single Dynamics 365 record by entity set and GUID.',
+    `Retrieve a single Dynamics 365 record by entity set and GUID. Allowed entity sets: ${[...ALLOWED_ENTITY_SETS].join(', ')}.`,
     {
       entitySet: z.string().describe('Entity set name, e.g. "opportunities", "accounts"'),
       id: z.string().describe('Record GUID'),
@@ -220,12 +379,23 @@ export function registerTools(server, crmClient) {
     },
     async ({ entitySet, id, select }) => {
       if (!entitySet) return error('entitySet is required');
+
+      if (!isEntityAllowed(entitySet)) {
+        auditLog({ tool: 'crm_get_record', entitySet, blocked: true, reason: 'entity not in allowlist' });
+        return error(
+          `Entity set "${entitySet}" is not in the allowed list. ` +
+          `Permitted entity sets: ${[...ALLOWED_ENTITY_SETS].join(', ')}. ` +
+          `If you need access to this entity, add it to ALLOWED_ENTITY_SETS in tools.js.`
+        );
+      }
+
       const normalized = normalizeGuid(id);
       if (!isValidGuid(normalized)) return error('Invalid GUID');
       const query = {};
       if (select) query.$select = select;
       const result = await crmClient.request(`${entitySet}(${normalized})`, { query });
       if (!result.ok) return error(`Get record failed (${result.status}): ${result.data?.message}`);
+      auditLog({ tool: 'crm_get_record', entitySet, recordCount: 1 });
       return text(result.data);
     }
   );
@@ -280,7 +450,7 @@ export function registerTools(server, crmClient) {
   // ── get_milestones ──────────────────────────────────────────
   server.tool(
     'get_milestones',
-    'Get engagement milestones by customer name, opportunity name/GUID, milestoneId, milestone number, or owner. Resolves customer/opportunity keywords to GUIDs internally — no need to call list_opportunities first. Supports batch opportunityIds, status/keyword filtering, task-presence filtering, and inline task embedding.',
+    'Get engagement milestones scoped by customer name, opportunity name/GUID, milestoneId, milestone number, or owner. Always requires a scoping parameter — never returns all milestones unscoped. Resolves customer/opportunity keywords to GUIDs internally — no need to call list_opportunities first. Supports batch opportunityIds, status/keyword filtering, task-presence filtering, and inline task embedding.',
     {
       customerKeyword: z.string().optional().describe('Customer name keyword — resolves accounts → opportunities → milestones in one call'),
       opportunityKeyword: z.string().optional().describe('Opportunity name keyword — resolves matching opportunities → milestones in one call'),
@@ -289,7 +459,7 @@ export function registerTools(server, crmClient) {
       milestoneNumber: z.string().optional().describe('Milestone number to search for, e.g. "7-123456789"'),
       milestoneId: z.string().optional().describe('Direct milestone GUID lookup'),
       ownerId: z.string().optional().describe('Owner system user GUID to list milestones for'),
-      mine: z.boolean().optional().describe('When true (default), returns milestones owned by the authenticated CRM user if no other filter is provided'),
+      mine: z.boolean().optional().describe('When explicitly set to true, returns milestones owned by the authenticated CRM user. Must be set explicitly — does NOT default to true. Prefer customerKeyword, opportunityKeyword, or opportunityId for narrower scoping.'),
       statusFilter: z.enum(['active', 'all']).optional().describe('Filter by status: active = Not Started/On Track/Blocked/At Risk'),
       keyword: z.string().optional().describe('Case-insensitive keyword filter across milestone name, opportunity, and workload'),
       format: z.enum(['full', 'summary']).optional().describe('Response format: full (default) or summary (grouped compact output)'),
@@ -414,7 +584,7 @@ export function registerTools(server, crmClient) {
         const nid = normalizeGuid(ownerId);
         if (!isValidGuid(nid)) return error('Invalid ownerId GUID');
         filter = `_ownerid_value eq '${nid}'`;
-      } else if (mine !== false) {
+      } else if (mine === true) {
         const whoAmI = await crmClient.request('WhoAmI');
         if (!whoAmI.ok || !whoAmI.data?.UserId) {
           return error(`Unable to resolve current CRM user for milestone lookup (${whoAmI.status}): ${whoAmI.data?.message || 'WhoAmI failed'}`);
@@ -422,7 +592,7 @@ export function registerTools(server, crmClient) {
         const nid = normalizeGuid(whoAmI.data.UserId);
         filter = `_ownerid_value eq '${nid}'`;
       } else {
-        return error('Provide customerKeyword, opportunityKeyword, opportunityId, milestoneNumber, milestoneId, ownerId, or set mine=true');
+        return error('Scoping required: provide customerKeyword, opportunityKeyword, opportunityId, opportunityIds, milestoneNumber, milestoneId, ownerId, or mine=true. Unscoped milestone queries are not allowed.');
       }
 
       const result = await crmClient.requestAllPages('msp_engagementmilestones', {
@@ -540,22 +710,26 @@ export function registerTools(server, crmClient) {
     }
   );
 
-  // ── create_task ─────────────────────────────────────────────
+  // ── create_milestone ───────────────────────────────────────
   server.tool(
     'create_milestone',
-    'Create an engagement milestone linked to an opportunity. Supports date, monthly use, status, category, commitment, owner, workload, and comments.',
+    'Create an engagement milestone linked to an opportunity. Supports date, monthly use, status, category, commitment, owner, workload, comments, workload type, delivered by, preferred Azure region, and Azure capacity type.',
     {
       opportunityId: z.string().describe('Opportunity GUID to link the milestone to'),
       name: z.string().describe('Milestone name/title'),
-      milestoneDate: z.string().optional().describe('Milestone date in YYYY-MM-DD format'),
-      monthlyUse: z.number().optional().describe('Monthly use value'),
-      milestoneCategory: z.number().optional().describe('Milestone category code'),
+      milestoneDate: z.string().describe('Required. Milestone date in YYYY-MM-DD format'),
+      monthlyUse: z.number().describe('Required. Monthly use value'),
+      milestoneCategory: z.number().describe('Required. Milestone category code (e.g. 861980002=Production)'),
       commitmentRecommendation: z.number().optional().describe('Commitment recommendation code'),
       milestoneStatus: z.number().optional().describe('Milestone status code'),
-      workloadId: z.string().optional().describe('Workload GUID'),
-      ownerId: z.string().optional().describe('System user GUID to assign as owner'),
+      workloadId: z.string().describe('Required. Workload GUID (lookup) — use _msp_workloadlkid_value from an existing milestone on the same opportunity, or query msp_workloads by msp_name'),
+      ownerId: z.string().optional().describe('System user GUID to assign as owner. Defaults to current user if omitted'),
       transactionCurrencyId: z.string().optional().describe('Transaction currency GUID'),
-      forecastComments: z.string().optional().describe('Forecast comments text')
+      forecastComments: z.string().optional().describe('Forecast comments text'),
+      workloadType: z.number().optional().describe(`Required for milestone view. Workload Type: ${WORKLOAD_TYPES.map(o => `${o.value}=${o.label}`).join(', ')}.`),
+      deliveredBy: z.number().optional().describe(`Required for milestone view. Delivered By: ${DELIVERED_BY.map(o => `${o.value}=${o.label}`).join(', ')}.`),
+      preferredAzureRegion: z.number().optional().describe(`Required for milestone view. Preferred Azure Region. Common values: ${PREFERRED_AZURE_REGIONS_COMMON.map(o => `${o.value}=${o.label}`).join(', ')}. Use get_milestone_field_options(field:"preferredAzureRegion") for the full list of 75 regions.`),
+      azureCapacityType: z.string().optional().describe(`Required for milestone view. Azure Capacity Type (MultiSelectPicklist — pass comma-separated codes for multiple, e.g. "861980081,861980065"). Common values: ${AZURE_CAPACITY_TYPES_COMMON.map(o => `${o.value}=${o.label}`).join(', ')}. Use get_milestone_field_options(field:"azureCapacityType") for the full list of 65 types.`)
     },
     async ({
       opportunityId,
@@ -568,11 +742,44 @@ export function registerTools(server, crmClient) {
       workloadId,
       ownerId,
       transactionCurrencyId,
-      forecastComments
+      forecastComments,
+      workloadType,
+      deliveredBy,
+      preferredAzureRegion,
+      azureCapacityType
     }) => {
       const oppNid = normalizeGuid(opportunityId);
       if (!isValidGuid(oppNid)) return error('Invalid opportunityId GUID');
       if (!name) return error('name is required');
+
+      // Validate required fields — must be explicitly provided
+      const missingViewFields = [];
+      if (!milestoneDate) missingViewFields.push('milestoneDate');
+      if (monthlyUse === undefined) missingViewFields.push('monthlyUse');
+      if (milestoneCategory === undefined) missingViewFields.push('milestoneCategory');
+      if (!workloadId) missingViewFields.push('workloadId');
+      if (workloadType === undefined) missingViewFields.push('workloadType');
+      if (deliveredBy === undefined) missingViewFields.push('deliveredBy');
+      if (preferredAzureRegion === undefined) missingViewFields.push('preferredAzureRegion');
+      if (azureCapacityType === undefined) missingViewFields.push('azureCapacityType');
+      if (missingViewFields.length) {
+        const fieldHints = {
+          milestoneDate: 'YYYY-MM-DD format',
+          monthlyUse: 'numeric value (e.g. 1000)',
+          milestoneCategory: '861980002=Production, 861980000=POC/Pilot',
+          workloadId: 'Workload GUID — use _msp_workloadlkid_value from an existing milestone on the same opportunity, or query msp_workloads by msp_name',
+          workloadType: WORKLOAD_TYPES.map(o => `${o.value}=${o.label}`).join(', '),
+          deliveredBy: DELIVERED_BY.map(o => `${o.value}=${o.label}`).join(', '),
+          preferredAzureRegion: PREFERRED_AZURE_REGIONS_COMMON.map(o => `${o.value}=${o.label}`).join(', ') + ' (common — use get_milestone_field_options for full list)',
+          azureCapacityType: AZURE_CAPACITY_TYPES_COMMON.map(o => `${o.value}=${o.label}`).join(', ') + ' (common — use get_milestone_field_options for full list)'
+        };
+        const details = missingViewFields.map(f => `  - ${f}: ${fieldHints[f]}`).join('\n');
+        return error(
+          `Missing required milestone view fields: ${missingViewFields.join(', ')}. ` +
+          'These fields are mandatory for the milestone to display correctly in the opportunity milestone view.\n' +
+          'Available values:\n' + details
+        );
+      }
 
       const oppLookup = await crmClient.request(`opportunities(${oppNid})`, {
         query: { $select: 'name' }
@@ -587,18 +794,24 @@ export function registerTools(server, crmClient) {
         'msp_OpportunityId@odata.bind': `/opportunities(${oppNid})`
       };
 
-      if (milestoneDate !== undefined) payload.msp_milestonedate = milestoneDate;
-      if (monthlyUse !== undefined) payload.msp_monthlyuse = monthlyUse;
-      if (milestoneCategory !== undefined) payload.msp_milestonecategory = milestoneCategory;
+      // Required fields — validated above, always present
+      payload.msp_milestonedate = milestoneDate;
+      payload.msp_monthlyuse = monthlyUse;
+      payload.msp_milestonecategory = milestoneCategory;
+
       if (commitmentRecommendation !== undefined) payload.msp_commitmentrecommendation = commitmentRecommendation;
       if (milestoneStatus !== undefined) payload.msp_milestonestatus = milestoneStatus;
       if (forecastComments !== undefined) payload.msp_forecastcomments = forecastComments;
 
-      if (workloadId) {
-        const workloadNid = normalizeGuid(workloadId);
-        if (!isValidGuid(workloadNid)) return error('Invalid workloadId GUID');
-        payload['msp_WorkloadlkId@odata.bind'] = `/msp_workloads(${workloadNid})`;
-      }
+      // Required milestone view fields — validated above, always present
+      payload.msp_milestoneworkload = workloadType;
+      payload.msp_deliveryspecifiedfield = deliveredBy;
+      payload.msp_milestonepreferredazureregion = preferredAzureRegion;
+      payload.msp_milestoneazurecapacitytype = azureCapacityType;
+
+      const workloadNid = normalizeGuid(workloadId);
+      if (!isValidGuid(workloadNid)) return error('Invalid workloadId GUID');
+      payload['msp_WorkloadlkId@odata.bind'] = `/msp_workloads(${workloadNid})`;
 
       if (ownerId) {
         const ownerNid = normalizeGuid(ownerId);
@@ -630,6 +843,7 @@ export function registerTools(server, crmClient) {
           opportunityId: oppNid,
           opportunityName
         },
+        fieldSummary: resolvePayloadLabels(payload),
         payload,
         message: `Staged ${op.id}: ${op.description}. Approve via execute_operation or from the approval UI.`
       });
@@ -734,7 +948,7 @@ export function registerTools(server, crmClient) {
   // ── close_task ──────────────────────────────────────────────
   server.tool(
     'close_task',
-    'Close a task using the CloseTask action (with fallback to bound Close endpoint, then PATCH statecode/statuscode).',
+    'Close a task using the CloseTask action (with fallback to bound Close endpoint).',
     {
       taskId: z.string().describe('Task GUID'),
       statusCode: z.number().describe('Status code for the closure (e.g. 5 = Completed, 6 = Cancelled)'),
@@ -771,9 +985,6 @@ export function registerTools(server, crmClient) {
       // Attach fallback info for executor
       op.fallbackEntitySet = `tasks(${nid})/Microsoft.Dynamics.CRM.Close`;
       op.fallbackPayload = { Status: statusCode };
-      // PATCH-based fallback when neither CloseTask action nor bound Close endpoint exist
-      op.patchFallbackEntitySet = `tasks(${nid})`;
-      op.patchFallbackPayload = { statecode: statusCode === 6 ? 2 : 1, statuscode: statusCode };
 
       return text({
         staged: true,
@@ -789,20 +1000,66 @@ export function registerTools(server, crmClient) {
   // ── update_milestone ────────────────────────────────────────
   server.tool(
     'update_milestone',
-    'Update fields on an engagement milestone (date, monthly use, comments).',
+    'Update fields on an engagement milestone. Only fields you provide will be changed — all other fields are preserved. Supports name, date, monthly use, status, category, commitment, workload, owner, currency, comments, workload type, delivered by, preferred Azure region, and Azure capacity type.',
     {
       milestoneId: z.string().describe('Engagement milestone GUID'),
+      name: z.string().optional().describe('New milestone name/title (cannot be empty)'),
       milestoneDate: z.string().optional().describe('New milestone date YYYY-MM-DD'),
       monthlyUse: z.number().optional().describe('New monthly use value'),
-      forecastComments: z.string().optional().describe('Forecast comments text')
+      milestoneCategory: z.number().optional().describe('New milestone category code'),
+      commitmentRecommendation: z.number().optional().describe('New commitment recommendation code'),
+      milestoneStatus: z.number().optional().describe('New milestone status code'),
+      workloadId: z.string().optional().describe('New workload GUID (use null to clear)'),
+      ownerId: z.string().optional().describe('New owner system user GUID'),
+      transactionCurrencyId: z.string().optional().describe('New transaction currency GUID'),
+      forecastComments: z.string().optional().describe('Forecast comments text'),
+      workloadType: z.number().optional().describe(`Workload Type: ${WORKLOAD_TYPES.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      deliveredBy: z.number().optional().describe(`Delivered By: ${DELIVERED_BY.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      preferredAzureRegion: z.number().optional().describe(`Preferred Azure Region. Common: ${PREFERRED_AZURE_REGIONS_COMMON.map(o => `${o.value}=${o.label}`).join(', ')}. Full list via get_milestone_field_options.`),
+      azureCapacityType: z.string().optional().describe(`Azure Capacity Type (MultiSelectPicklist — comma-separated codes). Common: ${AZURE_CAPACITY_TYPES_COMMON.map(o => `${o.value}=${o.label}`).join(', ')}. Full list via get_milestone_field_options.`)
     },
-    async ({ milestoneId, milestoneDate, monthlyUse, forecastComments }) => {
+    async ({ milestoneId, name, milestoneDate, monthlyUse, milestoneCategory, commitmentRecommendation, milestoneStatus, workloadId, ownerId, transactionCurrencyId, forecastComments, workloadType, deliveredBy, preferredAzureRegion, azureCapacityType }) => {
       const nid = normalizeGuid(milestoneId);
       if (!isValidGuid(nid)) return error('Invalid milestoneId GUID');
+
+      // Guard: name must not be blanked
+      if (name !== undefined && !name.trim()) return error('name cannot be empty — omit the field to keep the existing name');
+
       const payload = {};
+      if (name !== undefined) payload.msp_name = name;
       if (milestoneDate !== undefined) payload.msp_milestonedate = milestoneDate;
       if (monthlyUse !== undefined) payload.msp_monthlyuse = monthlyUse;
+      if (milestoneCategory !== undefined) payload.msp_milestonecategory = milestoneCategory;
+      if (commitmentRecommendation !== undefined) payload.msp_commitmentrecommendation = commitmentRecommendation;
+      if (milestoneStatus !== undefined) payload.msp_milestonestatus = milestoneStatus;
       if (forecastComments !== undefined) payload.msp_forecastcomments = forecastComments;
+      if (workloadType !== undefined) payload.msp_milestoneworkload = workloadType;
+      if (deliveredBy !== undefined) payload.msp_deliveryspecifiedfield = deliveredBy;
+      if (preferredAzureRegion !== undefined) payload.msp_milestonepreferredazureregion = preferredAzureRegion;
+      if (azureCapacityType !== undefined) payload.msp_milestoneazurecapacitytype = azureCapacityType;
+
+      if (workloadId !== undefined) {
+        if (workloadId) {
+          const workloadNid = normalizeGuid(workloadId);
+          if (!isValidGuid(workloadNid)) return error('Invalid workloadId GUID');
+          payload['msp_WorkloadlkId@odata.bind'] = `/msp_workloads(${workloadNid})`;
+        } else {
+          payload['msp_WorkloadlkId@odata.bind'] = null;
+        }
+      }
+
+      if (ownerId !== undefined) {
+        const ownerNid = normalizeGuid(ownerId);
+        if (!isValidGuid(ownerNid)) return error('Invalid ownerId GUID');
+        payload['ownerid@odata.bind'] = `/systemusers(${ownerNid})`;
+      }
+
+      if (transactionCurrencyId !== undefined) {
+        const currencyNid = normalizeGuid(transactionCurrencyId);
+        if (!isValidGuid(currencyNid)) return error('Invalid transactionCurrencyId GUID');
+        payload['transactioncurrencyid@odata.bind'] = `/transactioncurrencies(${currencyNid})`;
+      }
+
       if (Object.keys(payload).length === 0) return error('No fields to update');
 
       // Fetch full milestone record for identity verification + before-state
@@ -895,8 +1152,9 @@ export function registerTools(server, crmClient) {
         operationId: op.id,
         description: op.description,
         identity,
-        before,
-        after: payload,
+        before: resolvePayloadLabels(before),
+        after: resolvePayloadLabels(payload),
+        payload,
         message: `Staged ${op.id}: ${op.description}. Approve via execute_operation or from the approval UI.`
       });
     }
@@ -925,6 +1183,38 @@ export function registerTools(server, crmClient) {
       if (!result.ok) return error(`Account lookup failed (${result.status}): ${result.data?.message}`);
       const accounts = result.data?.value || [];
       return text({ count: accounts.length, accounts });
+    }
+  );
+
+  // ── get_milestone_field_options ─────────────────────────────
+  server.tool(
+    'get_milestone_field_options',
+    'Retrieve available picklist options for milestone fields from Dynamics 365 metadata. Use before create_milestone to discover valid values for required fields.',
+    {
+      field: z.enum(['workloadType', 'deliveredBy', 'preferredAzureRegion', 'azureCapacityType']).describe('Which milestone picklist field to retrieve options for')
+    },
+    async ({ field }) => {
+      const fieldMap = {
+        workloadType: 'msp_milestoneworkload',
+        deliveredBy: 'msp_deliveryspecifiedfield',
+        preferredAzureRegion: 'msp_milestonepreferredazureregion',
+        azureCapacityType: 'msp_milestoneazurecapacitytype'
+      };
+      const logicalName = fieldMap[field];
+      const result = await crmClient.request(
+        `EntityDefinitions(LogicalName='msp_engagementmilestone')/Attributes(LogicalName='${logicalName}')/Microsoft.Dynamics.CRM.PicklistAttributeMetadata`,
+        { query: { $select: 'LogicalName', $expand: 'OptionSet($select=Options)' } }
+      );
+      if (!result.ok) return error(`Metadata query failed (${result.status}): ${result.data?.message}`);
+
+      const options = result.data?.OptionSet?.Options || [];
+      const parsed = options
+        .map(o => ({
+          value: o?.Value,
+          label: o?.Label?.UserLocalizedLabel?.Label || o?.Label?.LocalizedLabels?.[0]?.Label || ''
+        }))
+        .filter(o => Number.isInteger(o.value) && o.label);
+      return text({ field, logicalName, options: parsed });
     }
   );
 
@@ -1371,13 +1661,10 @@ export function registerTools(server, crmClient) {
       // Execute against CRM
       let result;
       if (op.type === 'close_task') {
-        // Try primary CloseTask action, then bound Close, then PATCH fallback
+        // Try primary CloseTask action, fallback to bound Close
         result = await crmClient.request(op.entitySet, { method: op.method, body: op.payload });
         if (!result.ok && result.status !== 204 && op.fallbackEntitySet) {
           result = await crmClient.request(op.fallbackEntitySet, { method: 'POST', body: op.fallbackPayload });
-        }
-        if (!result.ok && result.status !== 204 && op.patchFallbackEntitySet) {
-          result = await crmClient.request(op.patchFallbackEntitySet, { method: 'PATCH', body: op.patchFallbackPayload });
         }
       } else {
         result = await crmClient.request(op.entitySet, { method: op.method, body: op.payload });
@@ -1435,9 +1722,6 @@ export function registerTools(server, crmClient) {
             result = await crmClient.request(op.entitySet, { method: op.method, body: op.payload });
             if (!result.ok && result.status !== 204 && op.fallbackEntitySet) {
               result = await crmClient.request(op.fallbackEntitySet, { method: 'POST', body: op.fallbackPayload });
-            }
-            if (!result.ok && result.status !== 204 && op.patchFallbackEntitySet) {
-              result = await crmClient.request(op.patchFallbackEntitySet, { method: 'PATCH', body: op.patchFallbackPayload });
             }
           } else {
             result = await crmClient.request(op.entitySet, { method: op.method, body: op.payload });
