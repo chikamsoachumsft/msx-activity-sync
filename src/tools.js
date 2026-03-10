@@ -157,6 +157,24 @@ function resolvePicklistLabel(options, value) {
   return match ? `${match.label} (${num})` : String(num);
 }
 
+/**
+ * Resolve a picklist input that may be a numeric code or a human-readable label.
+ * Returns the numeric code, or undefined if unresolvable.
+ */
+function resolveOptionValue(options, input) {
+  if (input === undefined || input === null) return undefined;
+  // Already a number — validate it exists
+  if (typeof input === 'number') {
+    return options.some(o => o.value === input) ? input : undefined;
+  }
+  // String: try numeric parse first
+  const asNum = Number(input);
+  if (!isNaN(asNum) && options.some(o => o.value === asNum)) return asNum;
+  // String label match (case-insensitive)
+  const match = options.find(o => o.label.toLowerCase() === String(input).toLowerCase().trim());
+  return match ? match.value : undefined;
+}
+
 /** Map of CRM payload keys to their picklist arrays for resolution. */
 const PICKLIST_MAP = {
   msp_milestoneworkload: WORKLOAD_TYPES,
@@ -719,9 +737,9 @@ export function registerTools(server, crmClient) {
       name: z.string().describe('Milestone name/title'),
       milestoneDate: z.string().describe('Required. Milestone date in YYYY-MM-DD format'),
       monthlyUse: z.number().describe('Required. Monthly use value'),
-      milestoneCategory: z.number().describe('Required. Milestone category code (e.g. 861980002=Production)'),
-      commitmentRecommendation: z.number().optional().describe('Commitment recommendation code'),
-      milestoneStatus: z.number().optional().describe('Milestone status code'),
+      milestoneCategory: z.number().describe(`Required. Milestone category: ${MILESTONE_CATEGORIES.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      commitmentRecommendation: z.number().optional().describe(`Commitment recommendation: ${COMMITMENT_RECOMMENDATIONS.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      milestoneStatus: z.union([z.number(), z.string()]).optional().describe(`Milestone status (name or code): ${MILESTONE_STATUSES.map(o => `${o.label}=${o.value}`).join(', ')}`),
       workloadId: z.string().describe('Required. Workload GUID (lookup) — use _msp_workloadlkid_value from an existing milestone on the same opportunity, or query msp_workloads by msp_name'),
       ownerId: z.string().optional().describe('System user GUID to assign as owner. Defaults to current user if omitted'),
       transactionCurrencyId: z.string().optional().describe('Transaction currency GUID'),
@@ -800,7 +818,11 @@ export function registerTools(server, crmClient) {
       payload.msp_milestonecategory = milestoneCategory;
 
       if (commitmentRecommendation !== undefined) payload.msp_commitmentrecommendation = commitmentRecommendation;
-      if (milestoneStatus !== undefined) payload.msp_milestonestatus = milestoneStatus;
+      if (milestoneStatus !== undefined) {
+        const resolved = resolveOptionValue(MILESTONE_STATUSES, milestoneStatus);
+        if (resolved === undefined) return error(`Invalid milestoneStatus "${milestoneStatus}". Valid: ${MILESTONE_STATUSES.map(o => `${o.label} (${o.value})`).join(', ')}`);
+        payload.msp_milestonestatus = resolved;
+      }
       if (forecastComments !== undefined) payload.msp_forecastcomments = forecastComments;
 
       // Required milestone view fields — validated above, always present
@@ -1006,9 +1028,9 @@ export function registerTools(server, crmClient) {
       name: z.string().optional().describe('New milestone name/title (cannot be empty)'),
       milestoneDate: z.string().optional().describe('New milestone date YYYY-MM-DD'),
       monthlyUse: z.number().optional().describe('New monthly use value'),
-      milestoneCategory: z.number().optional().describe('New milestone category code'),
-      commitmentRecommendation: z.number().optional().describe('New commitment recommendation code'),
-      milestoneStatus: z.number().optional().describe('New milestone status code'),
+      milestoneCategory: z.number().optional().describe(`Milestone category: ${MILESTONE_CATEGORIES.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      commitmentRecommendation: z.number().optional().describe(`Commitment recommendation: ${COMMITMENT_RECOMMENDATIONS.map(o => `${o.value}=${o.label}`).join(', ')}`),
+      milestoneStatus: z.union([z.number(), z.string()]).optional().describe(`Milestone status (name or code): ${MILESTONE_STATUSES.map(o => `${o.label}=${o.value}`).join(', ')}`),
       workloadId: z.string().optional().describe('New workload GUID (use null to clear)'),
       ownerId: z.string().optional().describe('New owner system user GUID'),
       transactionCurrencyId: z.string().optional().describe('New transaction currency GUID'),
@@ -1031,7 +1053,11 @@ export function registerTools(server, crmClient) {
       if (monthlyUse !== undefined) payload.msp_monthlyuse = monthlyUse;
       if (milestoneCategory !== undefined) payload.msp_milestonecategory = milestoneCategory;
       if (commitmentRecommendation !== undefined) payload.msp_commitmentrecommendation = commitmentRecommendation;
-      if (milestoneStatus !== undefined) payload.msp_milestonestatus = milestoneStatus;
+      if (milestoneStatus !== undefined) {
+        const resolved = resolveOptionValue(MILESTONE_STATUSES, milestoneStatus);
+        if (resolved === undefined) return error(`Invalid milestoneStatus "${milestoneStatus}". Valid: ${MILESTONE_STATUSES.map(o => `${o.label} (${o.value})`).join(', ')}`);
+        payload.msp_milestonestatus = resolved;
+      }
       if (forecastComments !== undefined) payload.msp_forecastcomments = forecastComments;
       if (workloadType !== undefined) payload.msp_milestoneworkload = workloadType;
       if (deliveredBy !== undefined) payload.msp_deliveryspecifiedfield = deliveredBy;

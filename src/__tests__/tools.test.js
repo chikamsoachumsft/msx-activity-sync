@@ -1260,6 +1260,32 @@ describe('registerTools', () => {
       expect(parsed.after.msp_forecastcomments).toBeUndefined();
     });
 
+    it('accepts milestoneStatus as string label', async () => {
+      crm.request.mockImplementation(async (path) => {
+        if (path === 'WhoAmI') return { ok: true, status: 200, data: { UserId: 'abc-123' } };
+        if (path.startsWith('msp_engagementmilestones(')) return { ok: true, status: 200, data: makeMilestoneRecord() };
+        return { ok: true, status: 200, data: {} };
+      });
+
+      const result = await callTool(server, 'update_milestone', {
+        milestoneId: MILESTONE_GUID,
+        milestoneStatus: 'Cancelled'
+      });
+      expect(result.isError).toBeUndefined();
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.payload.msp_milestonestatus).toBe(861980004);
+      expect(parsed.after.msp_milestonestatus).toBe('Cancelled (861980004)');
+    });
+
+    it('rejects invalid milestoneStatus string', async () => {
+      const result = await callTool(server, 'update_milestone', {
+        milestoneId: MILESTONE_GUID,
+        milestoneStatus: 'InvalidStatus'
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Invalid milestoneStatus');
+    });
+
     it('stages workload binding update', async () => {
       crm.request.mockImplementation(async (path) => {
         if (path === 'WhoAmI') return { ok: true, status: 200, data: { UserId: 'abc-123' } };
