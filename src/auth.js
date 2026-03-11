@@ -1,7 +1,9 @@
 // Azure CLI authentication service
 // Extracted from electron/services/auth.js — adapted for standalone Node.js usage
 
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -39,8 +41,38 @@ const parseTokenMetadata = (token, crmUrl) => {
   }
 };
 
-const getAzureCliCommand = () =>
-  process.platform === 'win32' ? 'az.cmd' : 'az';
+// Resolve the az CLI path once — VS Code MCP servers inherit a restricted PATH
+// that may miss user-installed locations (conda, homebrew, etc.)
+let _azCliPath;
+const getAzureCliCommand = () => {
+  if (_azCliPath) return _azCliPath;
+  if (process.platform === 'win32') { _azCliPath = 'az.cmd'; return _azCliPath; }
+
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+
+  // 1. Check common installation paths first (fastest, no shell spawn)
+  const candidates = [
+    `${home}/miniconda3/bin/az`, `${home}/anaconda3/bin/az`,
+    '/opt/homebrew/bin/az', '/usr/local/bin/az', '/usr/bin/az'
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) { _azCliPath = p; return _azCliPath; }
+  }
+
+  // 2. Try user's login shell (picks up conda, nvm, brew, etc.)
+  const shells = [process.env.SHELL, '/bin/zsh', '/bin/bash'].filter(Boolean);
+  for (const sh of shells) {
+    try {
+      const resolved = execSync(`${sh} -ilc "command -v az"`, {
+        encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
+      }).trim();
+      if (resolved && existsSync(resolved)) { _azCliPath = resolved; return _azCliPath; }
+    } catch { /* try next shell */ }
+  }
+
+  _azCliPath = 'az'; // fallback — will produce actionable ENOENT error
+  return _azCliPath;
+};
 
 export function createAuthService({ crmUrl, tenantId }) {
   const state = { token: null, metadata: null, crmUrl, tenantId };

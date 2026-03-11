@@ -5,11 +5,14 @@ MCP server for Dynamics 365 / MSX CRM operations. Gives GitHub Copilot (and any 
 ## Features
 
 - **Read tools** — query opportunities, milestones, tasks, accounts, and metadata via OData
-- **Write tools** — create/update/close tasks, update milestones — all staged for approval before execution
+- **Write tools** — create milestones, create/update/close tasks, update milestones — all staged for approval before execution
 - **Approval queue** — every CRM write is staged, previewed (before → after diff), and executed only after explicit human confirmation
 - **Batch operations** — stage multiple changes, review all at once, execute in one shot
 - **Azure CLI auth** — authenticates via `az account get-access-token` (no secrets in config)
 - **Composite tools** — higher-level operations like `find_milestones_needing_tasks` chain multiple CRM calls automatically
+- **Entity allowlist** — `crm_query` and `crm_get_record` restrict access to a declared set of entity sets, preventing open-ended data extraction
+- **Pagination ceiling** — `crm_query` auto-pagination caps at 500 records per call
+- **Audit logging** — every tool invocation emits structured NDJSON to stderr (tool name, entity set, record count, blocked requests)
 
 ## Prerequisites
 
@@ -71,8 +74,8 @@ Add the server to `.vscode/mcp.json` in your workspace:
 |---|---|
 | `crm_whoami` | Validate CRM access and return current user identity |
 | `crm_auth_status` | Check authentication status — user, expiry, CRM URL |
-| `crm_query` | Execute read-only OData GET against any Dynamics 365 entity set (supports `$filter`, `$select`, `$orderby`, `$top`, `$expand`, auto-pagination) |
-| `crm_get_record` | Retrieve a single record by entity set + GUID |
+| `crm_query` | Execute read-only OData GET against an **allowed** Dynamics 365 entity set (supports `$filter`, `$select`, `$orderby`, `$top`, `$expand`; auto-pagination capped at 500 records) |
+| `crm_get_record` | Retrieve a single record by entity set + GUID (entity must be on the allowlist) |
 | `list_opportunities` | List open opportunities by account IDs or customer name keyword |
 | `get_my_active_opportunities` | Active opportunities where you're the owner or have milestone ownership |
 | `get_milestones` | Milestones by ID, number, opportunity, owner, or "mine" — with status/keyword/task-presence filtering |
@@ -95,6 +98,7 @@ All write tools **stage** the operation and return a preview. Nothing is written
 
 | Tool | Description |
 |---|---|
+| `create_milestone` | Create a milestone linked to an opportunity |
 | `create_task` | Create a task linked to a milestone |
 | `update_task` | Update task fields (subject, due date, description, status) |
 | `close_task` | Close a task via CloseTask action |
@@ -290,10 +294,11 @@ For the best experience, add a `copilot-instructions.md` to your repo's `.github
 |---|---|
 | `src/index.js` | Entry point — creates McpServer, wires auth → CRM client → tools, connects stdio transport |
 | `src/tools.js` | All 22 MCP tool definitions with input validation, OData query construction, and approval queue integration |
-| `src/crm.js` | HTTP client for Dynamics 365 OData API — retry logic, pagination, token management |
+| `src/crm.js` | HTTP client for Dynamics 365 OData API — retry logic, pagination (with configurable ceiling), token management |
 | `src/auth.js` | Azure CLI token acquisition (`az account get-access-token`) with caching and expiry detection |
 | `src/validation.js` | GUID normalization, TPID validation, OData string sanitization |
 | `src/approval-queue.js` | EventEmitter-based queue for staged write operations with TTL expiry (10 min default) |
+| `src/audit.js` | Structured NDJSON audit logger — emits tool invocations, entity sets, record counts, and blocked requests to stderr |
 
 ## Running Tests
 
@@ -301,6 +306,48 @@ For the best experience, add a `copilot-instructions.md` to your repo's `.github
 cd mcp-server
 npm test            # single run
 npm run test:watch  # watch mode
+```
+
+## Data Governance
+
+### Entity Allowlist
+
+`crm_query` and `crm_get_record` only accept entity sets declared in `ALLOWED_ENTITY_SETS` (defined in `src/tools.js`). Queries to unlisted entities are rejected with a descriptive error. The current allowlist:
+
+| Entity Set | Purpose |
+|---|---|
+| `accounts` | Account lookup and TPID resolution |
+| `contacts` | Contact lookup |
+| `opportunities` | Pipeline and deal state |
+| `msp_engagementmilestones` | Milestone tracking |
+| `msp_dealteams` | Deal team membership |
+| `msp_workloads` | Workload lookup |
+| `tasks` | Task/activity records |
+| `systemusers` | User identity resolution |
+| `transactioncurrencies` | Currency lookup for milestones |
+| `connections` | Deal team / partner linkage (alternative to `msp_dealteams` in some orgs) |
+| `connectionroles` | Connection role names (companion to `connections`) |
+| `processstages` | BPF stage name resolution for MCEM stage identification |
+| `EntityDefinitions` | Metadata queries (e.g., status option sets) |
+
+To add an entity, update the `ALLOWED_ENTITY_SETS` set in `src/tools.js`. Purpose-built tools (e.g., `get_milestones`, `list_opportunities`) bypass the allowlist because they already constrain scope through hard-coded entity paths and field selections.
+
+### Pagination Ceiling
+
+`crm_query` caps auto-pagination at **500 records** (`CRM_QUERY_MAX_RECORDS` in `src/tools.js`). The `$top` parameter is also capped to this value. If more records exist, the response includes `truncated: true`. Purpose-built tools are not subject to this limit.
+
+### Audit Logging
+
+Every `crm_query` and `crm_get_record` invocation emits a structured NDJSON record to **stderr** (separate from MCP's stdio transport on stdout). Each record includes:
+
+```json
+{"ts": "2026-03-09T...", "tool": "crm_query", "entitySet": "accounts", "params": {"filter": "...", "select": "..."}, "recordCount": 12}
+```
+
+Blocked requests include `"blocked": true` and a `"reason"` field. To capture audit logs, redirect stderr:
+
+```bash
+node src/index.js 2>> /path/to/audit.ndjson
 ```
 
 ## See Also
