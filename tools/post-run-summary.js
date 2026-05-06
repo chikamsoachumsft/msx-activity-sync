@@ -50,6 +50,7 @@ const extract = (re, def = '?') => {
   return m ? m[1].trim() : def;
 };
 const created = extract(/\|\s*Tasks Created\s*\|\s*(\d+)\s*\|/i, '0');
+const alreadyExists = extract(/\|\s*Already in CRM \(skipped\)\s*\|\s*(\d+)\s*\|/i, '0');
 const skipped = extract(/\|\s*Meetings Skipped\s*\|\s*(\d+)\s*\|/i, '0');
 const failed = extract(/\|\s*Failures\s*\|\s*(\d+)\s*\|/i, '0');
 const followUp = extract(/\|\s*Follow-Up Required\s*\|\s*(\d+)\s*\|/i, '0');
@@ -63,6 +64,10 @@ const humanAction = (() => {
 })();
 const masterFollowUp = (() => {
   const m = latestContent.match(/##\s+Master Follow-Up List[^\n]*\n([\s\S]*?)(?=\n##\s|$)/i);
+  return m ? m[1].trim() : '';
+})();
+const alreadyExistsSection = (() => {
+  const m = latestContent.match(/##\s+Already Logged in CRM[^\n]*\n([\s\S]*?)(?=\n##\s|$)/i);
   return m ? m[1].trim() : '';
 })();
 
@@ -86,13 +91,14 @@ ${badge}
 | **Timestamp** | ${ts} |
 | **Range** | ${range} |
 | **Tasks created** | ${created} |
+| **Already in CRM (skipped)** | ${alreadyExists} |
 | **Meetings skipped** | ${skipped} |
 | **Failures** | ${failed} |
 | **Follow-up required** | ${followUp} |
 
 [Full report →](${reportLink})
 
-## Human Action Required
+${alreadyExistsSection ? `## Already Logged in CRM\n\n${alreadyExistsSection}\n\n` : ''}## Human Action Required
 
 ${humanAction}
 

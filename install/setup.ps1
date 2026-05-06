@@ -168,6 +168,27 @@ Write-Host ""
 Write-Host "    This will: dial VPN -> sync calendar -> create CRM tasks -> push log to GitHub"
 Write-Host "    Estimated time: 2-5 minutes"
 Write-Host ""
+
+# Detect first-time install and offer a backfill window
+$LastRunFile = Join-Path $StateDir "last-run-date.txt"
+$StateFile = Join-Path $StateDir "sync-state.json"
+$isFirstRun = -not (Test-Path $StateFile)
+if ($isFirstRun) {
+  Write-Host "    Looks like this is your first run." -ForegroundColor Cyan
+  Write-Host "    The agent skips meetings already logged in CRM (day-bucket dedupe),"
+  Write-Host "    so you can safely sync the past few days/weeks."
+  Write-Host ""
+  $backfillDays = Read-Host "How many days back should the test sync cover? [default: 7, 0 = today only, max recommended: 90]"
+  if ([string]::IsNullOrWhiteSpace($backfillDays)) { $backfillDays = "7" }
+  if ($backfillDays -match '^\d+$' -and [int]$backfillDays -ge 0 -and [int]$backfillDays -le 365) {
+    $startDate = (Get-Date).AddDays(-[int]$backfillDays).ToString("yyyy-MM-dd")
+    Set-Content -Path $LastRunFile -Value $startDate -NoNewline -Encoding ASCII
+    Ok "Backfill window set: $startDate -> today ($backfillDays days)"
+  } else {
+    Warn "Invalid value '$backfillDays' — using default 7-day window."
+  }
+}
+
 $run = Read-Host "Run test sync now? [Y/n]"
 $testRanOk = $false
 if ($run -ne 'n' -and $run -ne 'N') {

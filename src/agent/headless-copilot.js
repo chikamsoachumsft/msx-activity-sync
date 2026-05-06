@@ -197,11 +197,17 @@ If the subject matches but the DATE is different, it is a NEW occurrence — cre
 Example: "PerkinElmer Fortnightly Connect" processed on Apr 2 does NOT mean Apr 16's occurrence is done.
 
 ## CRITICAL — Duplicate Prevention (Backfill Safety)
-Before creating a task on ANY milestone, ALWAYS call \`msx_crm__get_milestone_activities\` first to check for existing tasks.
-Compare the meeting subject and date against ALL returned tasks (both open AND closed).
-If a task already exists with a matching or very similar subject and the same date, SKIP creating it — report it as "ALREADY EXISTS" in the output.
-This prevents duplicates when re-syncing date ranges that were previously processed.
-For the UPS Louisville workshop on Mar 25 2026: this was a hands-on workshop demoed to 1,000+ developers. Include "1,000+ developer attendees" in the task subject/description.
+Before creating ANY task on a milestone, you MUST check whether a task already exists on that milestone for the same calendar day as the meeting. This is the **only** reliable way to detect tasks the user logged manually, because manually-logged tasks may have completely different subjects than the calendar meeting (e.g. calendar says "James Hardie Weekly Touchpoint", user logged it as "Weekly check-in with JH").
+
+**Day-bucket rule (USE THIS):**
+1. Call \`msx_crm__get_milestone_activities\` with the target milestoneId.
+2. From the returned tasks, look at \`scheduledstart\` (or \`scheduledend\`/\`actualstart\` if present). Treat the date portion only — strip the time.
+3. If ANY task on that milestone has a scheduledstart date matching the meeting's calendar date — regardless of subject — treat it as **ALREADY EXISTS** and SKIP creation.
+4. If the calendar has multiple meetings on the same day for the same milestone (rare), allow creation up to N tasks where N = (calendar meetings on that day) − (existing CRM tasks on that day).
+
+**Output rule:** Items skipped this way go in a SEPARATE bucket called \`alreadyExists\` in your JSON summary — NOT in \`skipped\`. Use Decision **ALREADY EXISTS** in the per-meeting table. Always include the existing task's GUID and CRM link in the row's Reason column so the user can verify.
+
+This rule prevents duplicates when (a) the user manually logged the meeting, (b) a previous backfill already processed it, or (c) someone else on the deal team already logged it.
 `;
   } catch {
     stateContext = '\n## Sync State\nCould not load sync-state.json — proceed with caution.\n';
@@ -265,13 +271,14 @@ This is the MOST IMPORTANT part of your output. If you skip meetings from the ta
 | ... | ... | ... | ... | ... | ... |
 
 Rules:
-- Decision must be one of: **CREATED**, **SKIPPED**, **FOLLOW-UP**, **ALREADY PROCESSED**, or **FAILED**
+- Decision must be one of: **CREATED**, **SKIPPED**, **ALREADY EXISTS**, **FOLLOW-UP**, **ALREADY PROCESSED**, or **FAILED**
+- **ALREADY EXISTS** = a task already exists in CRM on the same milestone for the same calendar date (day-bucket rule). Include the existing task GUID + link in the Reason column.
 - **ALREADY PROCESSED** means BOTH the subject AND the exact calendar date match a sync-state entry. Same subject on a different date = NEW meeting, not a duplicate!
 - Every row = one meeting. If WorkIQ returned 40 meetings, the table has 40 rows.
 - DO NOT write "Various other internal meetings" or group rows — list each one individually
 
 After the full meeting table, output the JSON summary:
-{ created: [{ customer, subject, taskId, link }], skipped: [{ subject, reason }], failed: [...], followUp: [{ customer, subject, date, reason }] }
+{ created: [{ customer, subject, taskId, link }], skipped: [{ subject, reason }], alreadyExists: [{ customer, subject, date, existingTaskId, existingTaskLink }], failed: [...], followUp: [{ customer, subject, date, reason }] }
 `;
 }
 
@@ -416,11 +423,23 @@ ${followUpStatus.resolved.length > 0 ? `\n**Resolved this run:** ${followUpStatu
 ${jsonSummary ? `| Metric | Count |
 |--------|-------|
 | Tasks Created | ${jsonSummary.created?.length || 0} |
+| Already in CRM (skipped) | ${jsonSummary.alreadyExists?.length || 0} |
 | Meetings Skipped | ${jsonSummary.skipped?.length || 0} |
 | Failures | ${jsonSummary.failed?.length || 0} |
 | Follow-Up Required | ${jsonSummary.followUp?.length || 0} |
 | Needs Human Action | ${jsonSummary.needsUserInput?.length || actionItems.length} |` : '(No structured summary extracted from LLM output)'}
 
+${jsonSummary?.alreadyExists?.length > 0 ? `## Already Logged in CRM (${jsonSummary.alreadyExists.length})
+
+These meetings had a pre-existing task on the same milestone for the same date. **No new task was created** — review the list to confirm the existing tasks accurately reflect each meeting.
+
+| # | Date | Customer | Calendar Subject | Existing Task |
+|---|------|----------|------------------|---------------|
+${jsonSummary.alreadyExists.map((item, i) =>
+  `| ${i + 1} | ${item.date || 'N/A'} | ${item.customer || 'N/A'} | ${item.subject || 'N/A'} | ${item.existingTaskLink ? `[${(item.existingTaskId || '').slice(0, 8)}…](${item.existingTaskLink})` : (item.existingTaskId || 'N/A')} |`
+).join('\n')}
+
+` : ''}
 ## Human Action Required
 
 ${actionItems.length > 0 ? actionItems.map((a, i) => `${i + 1}. ${a}`).join('\n') : 'None — all meetings were handled automatically.'}
@@ -633,6 +652,27 @@ async function runOnce(opts) {
     const report = buildReport(opts, llmOutput, toolLog);
     const reportPath = saveReport(report, opts);
     log(`Report saved: ${reportPath}`);
+
+    // 7b. Emit a high-visibility banner for "ALREADY EXISTS" duplicates
+    //     so the scheduled-run.log shows them prominently (not just the report).
+    try {
+      const m = llmOutput.match(/```json\s*([\s\S]*?)```/);
+      const summary = m ? JSON.parse(m[1]) : null;
+      const dupes = summary?.alreadyExists || [];
+      if (dupes.length > 0) {
+        log('');
+        log('============================================================');
+        log(`  ${dupes.length} meeting(s) ALREADY LOGGED IN CRM — review these:`);
+        log('============================================================');
+        dupes.forEach((d, i) => {
+          log(`  ${i + 1}. [${d.date || '?'}] ${d.customer || '?'} — "${d.subject || '?'}"`);
+          if (d.existingTaskLink) log(`     existing task: ${d.existingTaskLink}`);
+          else if (d.existingTaskId) log(`     existing task id: ${d.existingTaskId}`);
+        });
+        log('============================================================');
+        log('');
+      }
+    } catch { /* best-effort banner */ }
 
     log('Copilot SDK session completed.');
 
