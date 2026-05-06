@@ -5,7 +5,7 @@ import { spawn, execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 90_000;
 
 const base64UrlDecode = (value) => {
   const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
@@ -193,4 +193,85 @@ export function createAuthService({ crmUrl, tenantId }) {
   const getCrmUrl = () => state.crmUrl;
 
   return { ensureAuth, getToken, getAuthStatus, getCrmUrl, clearToken, _state: state };
+}
+
+// ── Graph token helper ────────────────────────────────────────
+// Standalone helper for fetching a Microsoft Graph access token via az CLI.
+// Cached in-memory; refreshed when expiring within 2 minutes.
+const _graphTokenCache = { token: null, expiresAt: 0, tenantId: null };
+
+export async function getGraphToken({ tenantId = 'common' } = {}) {
+  const now = Date.now();
+
+  // Env-var override: lets the user supply a manually-acquired Graph token
+  // (e.g. from `Connect-MgGraph -Scopes "Chat.ReadWrite,Chat.Create"` →
+  // `(Get-MgContext).AccessToken` or via Get-AzAccessToken). Bypasses the
+  // az-CLI scope limitation for Chat.* operations.
+  const envToken = process.env.MSX_GRAPH_TOKEN || process.env.GRAPH_TOKEN;
+  if (envToken && envToken.trim()) {
+    return envToken.trim();
+  }
+
+  if (
+    _graphTokenCache.token &&
+    _graphTokenCache.tenantId === tenantId &&
+    _graphTokenCache.expiresAt - now > 120_000
+  ) {
+    return _graphTokenCache.token;
+  }
+
+  const args = [
+    'account', 'get-access-token',
+    '--resource', 'https://graph.microsoft.com',
+    '--tenant', tenantId,
+    '--query', 'accessToken',
+    '-o', 'tsv'
+  ];
+
+  return await new Promise((resolve, reject) => {
+    const proc = spawn(getAzureCliCommand(), args, {
+      shell: process.platform === 'win32',
+      windowsHide: true
+    });
+    let stdout = '';
+    let stderr = '';
+    const timeoutId = setTimeout(() => {
+      proc.kill();
+      reject(new Error('Azure CLI command timed out fetching Graph token.'));
+    }, DEFAULT_TIMEOUT_MS);
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (error) => {
+      clearTimeout(timeoutId);
+      if (error.code === 'ENOENT') {
+        reject(new Error('Azure CLI not found. Install it from https://learn.microsoft.com/cli/azure/install-azure-cli'));
+      } else {
+        reject(new Error(`Failed to run Azure CLI: ${error.message}`));
+      }
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timeoutId);
+      if (code !== 0) {
+        if (stderr.includes('AADSTS') || stderr.includes('login')) {
+          reject(new Error(`Azure CLI session expired. Run "az login --tenant ${tenantId}" then retry.`));
+        } else {
+          reject(new Error(`Azure CLI error: ${stderr || 'Unknown error'}`));
+        }
+        return;
+      }
+      const token = stdout.trim();
+      if (!token) { reject(new Error('Azure CLI returned empty Graph token')); return; }
+      // Parse exp from JWT
+      let expiresAt = now + 30 * 60 * 1000;
+      try {
+        const payload = JSON.parse(base64UrlDecode(token.split('.')[1]));
+        if (payload.exp) expiresAt = Number(payload.exp) * 1000;
+      } catch { /* ignore */ }
+      _graphTokenCache.token = token;
+      _graphTokenCache.expiresAt = expiresAt;
+      _graphTokenCache.tenantId = tenantId;
+      resolve(token);
+    });
+  });
 }

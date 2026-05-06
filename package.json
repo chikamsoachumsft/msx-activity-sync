@@ -5,17 +5,27 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "msx-mcp": "src/index.js"
+    "msx-mcp": "src/index.js",
+    "activity-sync": "src/agent/cli.js"
   },
   "scripts": {
     "start": "node src/index.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "keywords": ["mcp", "dynamics365", "crm", "msx"],
+  "keywords": [
+    "mcp",
+    "dynamics365",
+    "crm",
+    "msx"
+  ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@azure/msal-node": "^3.8.10",
+    "@azure/msal-node-extensions": "^1.5.32",
+    "@github/copilot-sdk": "^0.2.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "vitest": "^4.0.18"

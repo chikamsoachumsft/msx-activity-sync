@@ -1,0 +1,135 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "investigate-workiq",
+			"type": "shell",
+			"command": "npm pack @microsoft/workiq --dry-run 2>&1 | Select-Object -First 5; Write-Host '---'; npm view @microsoft/workiq main description homepage repository.url 2>&1"
+		},
+		{
+			"label": "workiq-help",
+			"type": "shell",
+			"command": "npx -y @microsoft/workiq mcp --help 2>&1; echo '===EXIT:' $LASTEXITCODE '==='"
+		},
+		{
+			"label": "workiq-root-help",
+			"type": "shell",
+			"command": "npx -y @microsoft/workiq --help 2>&1"
+		},
+		{
+			"label": "test-workiq-headless",
+			"type": "shell",
+			"command": "node src/agent/test-workiq-headless.mjs 2>&1"
+		},
+		{
+			"label": "syntax-check",
+			"type": "shell",
+			"command": "node --check src/agent/calendar.js && echo 'calendar.js OK' && node --check src/agent/sync.js && echo 'sync.js OK' && node --check src/agent/headless.js && echo 'headless.js OK'"
+		},
+		{
+			"label": "e2e-dryrun",
+			"type": "shell",
+			"command": "node src/agent/headless.js --start 2026-03-12 --end 2026-03-13 --dry-run 2>&1"
+		},
+		{
+			"label": "check-copilot-cli",
+			"type": "shell",
+			"command": "where.exe copilot 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host 'copilot CLI not found'; gh copilot --version 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host 'gh copilot not found either' } } else { copilot --version }"
+		},
+		{
+			"label": "find-copilot",
+			"type": "shell",
+			"command": "where.exe copilot 2>&1"
+		},
+		{
+			"label": "copilot-version-check",
+			"type": "shell",
+			"command": "where.exe copilot 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host 'COPILOT_CLI_NOT_FOUND' } else { copilot --version }"
+		},
+		{
+			"label": "syntax-check-all",
+			"type": "shell",
+			"command": "node --check src/agent/headless-copilot.js && echo 'headless-copilot.js OK' && node --check src/agent/calendar.js && echo 'calendar.js OK' && node --check src/agent/headless.js && echo 'headless.js OK'"
+		},
+		{
+			"label": "test-option-a",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run 2>&1"
+		},
+		{
+			"label": "debug-workiq",
+			"type": "shell",
+			"command": "node src/agent/debug-workiq.mjs 2>&1"
+		},
+		{
+			"label": "test-parser",
+			"type": "shell",
+			"command": "node src/agent/test-parser.mjs 2>&1"
+		},
+		{
+			"label": "test-parser",
+			"type": "shell",
+			"command": "node src/agent/test-parser.mjs"
+		},
+		{
+			"label": "e2e-dry-run",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run"
+		},
+		{
+			"label": "e2e-dryrun",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run"
+		},
+		{
+			"label": "e2e-dryrun2",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run 2>&1"
+		},
+		{
+			"label": "e2e-dryrun3",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run 2>&1"
+		},
+		{
+			"label": "e2e-dry-run",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run"
+		},
+		{
+			"label": "diag-parser",
+			"type": "shell",
+			"command": "node src/agent/diag-parser.mjs"
+		},
+		{
+			"label": "e2e-dryrun",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run"
+		},
+		{
+			"label": "e2e-dryrun-v2",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run"
+		},
+		{
+			"label": "e2e-yesterday",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run --start 2026-03-25 --end 2026-03-26"
+		},
+		{
+			"label": "e2e-yesterday",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run --start 2026-03-25 --end 2026-03-26"
+		},
+		{
+			"label": "e2e-yesterday",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run --start 2026-03-25 --end 2026-03-26"
+		},
+		{
+			"label": "e2e-yesterday-v2",
+			"type": "shell",
+			"command": "node src/agent/run.js --mode code --dry-run --start 2026-03-25 --end 2026-03-26"
+		}
+	]
+}

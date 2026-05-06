@@ -7,3 +7,13 @@ npm-debug.log*
 !.env.example
 .DS_Store
 coverage/
+.msal-cache.json
+logs/
+reports/
+
+# Local diagnostics / state
+_app-perms.json
+diag-*.json
+diag-*.txt
+sync-state.json
+.vscode/metadata.xml

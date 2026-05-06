@@ -1,361 +1,206 @@
-# msx-copilot-mcp
+# MSX Activity Sync
 
-MCP server for Dynamics 365 / MSX CRM operations. Gives GitHub Copilot (and any MCP-compatible AI agent) read/write access to opportunities, milestones, tasks, and account data — with a **human-in-the-loop approval queue** for all write operations.
+**Stop manually logging customer meetings in MSX CRM.** This agent reads your Outlook calendar, figures out which meetings belong to which opportunity milestones, and creates the matching CRM tasks for you — automatically, every weekday.
 
-> **Want to understand how it works?** See the [Documentation Guide](docs/README.md) for architecture walkthroughs, the staged write flow, and milestone query optimization.
+## What you get
 
-## Features
+- 🗓️ **Calendar → CRM, hands-off.** Customer meetings become CRM task activities on the right milestone.
+- 🤖 **Smart matching.** An LLM classifier (WorkIQ MCP) maps meeting subjects/attendees to the correct opportunity + milestone. Falls back gracefully if the model is unavailable.
+- ⏰ **Runs unattended.** Windows Task Scheduler fires it at 4:15 PM on weekdays, wakes the laptop if asleep, dials the VPN automatically, runs even on battery.
+- 🔁 **Catches up missed days.** Out sick? Plane mode? The next run backfills weekdays you missed.
+- 📊 **Personal log archive.** Every run pushes a markdown report + auto-updated README to your own private GitHub repo so you can see what got synced.
+- 🔒 **No secrets stored.** Auth via `az login` + Windows VPN profile. You own the data, the logs, and the schedule.
 
-- **Read tools** — query opportunities, milestones, tasks, accounts, and metadata via OData
-- **Write tools** — create milestones, create/update/close tasks, update milestones — all staged for approval before execution
-- **Approval queue** — every CRM write is staged, previewed (before → after diff), and executed only after explicit human confirmation
-- **Batch operations** — stage multiple changes, review all at once, execute in one shot
-- **Azure CLI auth** — authenticates via `az account get-access-token` (no secrets in config)
-- **Composite tools** — higher-level operations like `find_milestones_needing_tasks` chain multiple CRM calls automatically
-- **Entity allowlist** — `crm_query` and `crm_get_record` restrict access to a declared set of entity sets, preventing open-ended data extraction
-- **Pagination ceiling** — `crm_query` auto-pagination caps at 500 records per call
-- **Audit logging** — every tool invocation emits structured NDJSON to stderr (tool name, entity set, record count, blocked requests)
+---
 
-## Prerequisites
+## ⚡ Set it up in 3 commands
 
-- **Node.js** ≥ 18
-- **Azure CLI** — [install](https://learn.microsoft.com/cli/azure/install-azure-cli), then sign in:
-  ```bash
-  az login
-  ```
-- **CRM access** — your Azure AD account must have Dynamics 365 API permissions for the target org
+> Requires: **Windows**, **Node 20+**, **Azure CLI** (`az`), **GitHub CLI** (`gh`), **Git**, and the **MSFT-AzVPN-Manual** VPN profile installed.
 
-## Quick Start
-
-```bash
-# Clone
-git clone https://github.com/Microsoft/msx-copilot-mcp.git
-cd msx-copilot-mcp/mcp-server
-
-# Install dependencies
-npm install
-
-# Run the server (stdio transport)
-npm start
+```powershell
+git clone https://github.com/chikamsoachumsft/msx-activity-sync.git
+cd msx-activity-sync
+.\install\setup.ps1
 ```
 
-## VS Code / Copilot Configuration
+The setup script will walk you through it interactively:
 
-Add the server to `.vscode/mcp.json` in your workspace:
+1. ✅ Checks prerequisites (Node, az, gh, git)
+2. ✅ Runs `npm install`
+3. ✅ Logs you into Azure (`az login`) if needed
+4. ✅ Tests your VPN dial
+5. ✅ Creates a private `<your-user>/activity-sync-logs` repo for run reports
+6. ✅ **Runs a test sync** — validates the full pipeline end-to-end
+7. ✅ **Registers the daily schedule** — only after you confirm the test worked
 
-```jsonc
-{
-  "servers": {
-    "msx-crm": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/absolute/path/to/msx-copilot-mcp/mcp-server/src/index.js"],
-      "env": {
-        "MSX_CRM_URL": "https://microsoftsales.crm.dynamics.com",
-        "MSX_TENANT_ID": "72f988bf-86f1-41af-91ab-2d7cd011db47"
-      }
-    }
-  }
-}
+That's it. After setup, you don't have to do anything — meetings will sync every weekday at 4:15 PM and reports will appear in your logs repo.
+
+### Setup flags
+
+```powershell
+.\install\setup.ps1 -NoLogsRepo                  # local-only, no GitHub publishing
+.\install\setup.ps1 -ScheduleTime 09:00          # different daily time
+.\install\setup.ps1 -VpnName "OtherVPN"          # different VPN profile
+.\install\setup.ps1 -LogsRepo "you/some-repo"    # use an existing repo
 ```
 
-> **Tip**: Replace the `args` path with the actual path on your machine. If you cloned to `~/Repos/msx-copilot-mcp`, use `["${userHome}/Repos/msx-copilot-mcp/mcp-server/src/index.js"]`.
+---
 
-### Environment Variables
+## How it works
 
-| Variable | Default | Description |
-|---|---|---|
-| `MSX_CRM_URL` | `https://microsoftsales.crm.dynamics.com` | Dynamics 365 org URL |
-| `MSX_TENANT_ID` | `72f988bf-86f1-41af-91ab-2d7cd011db47` | Azure AD tenant ID |
+For each working day in the sync window:
 
-## Tools Reference
+1. Fetches your Outlook calendar (Microsoft Graph)
+2. Classifies each meeting → which opportunity / milestone it belongs to (LLM via the WorkIQ MCP, with fallbacks)
+3. Stages CRM write operations (create task, close task, link to milestone)
+4. Executes the staged ops through the MSX CRM MCP
+5. Writes a `reports/sync_<window>.md` summary
+6. Publishes the latest report + a refreshed `README.md` to your private logs repo
 
-### Read Tools
+If your machine was asleep or VPN-disconnected when the schedule fired, the next run catches up missed weekdays automatically.
 
-| Tool | Description |
-|---|---|
-| `crm_whoami` | Validate CRM access and return current user identity |
-| `crm_auth_status` | Check authentication status — user, expiry, CRM URL |
-| `crm_query` | Execute read-only OData GET against an **allowed** Dynamics 365 entity set (supports `$filter`, `$select`, `$orderby`, `$top`, `$expand`; auto-pagination capped at 500 records) |
-| `crm_get_record` | Retrieve a single record by entity set + GUID (entity must be on the allowlist) |
-| `list_opportunities` | List open opportunities by account IDs or customer name keyword |
-| `get_my_active_opportunities` | Active opportunities where you're the owner or have milestone ownership |
-| `get_milestones` | Milestones by ID, number, opportunity, owner, or "mine" — with status/keyword/task-presence filtering |
-| `get_milestone_activities` | Tasks/activities linked to one or more milestones |
-| `find_milestones_needing_tasks` | Composite: customer keywords → accounts → opps → milestones → identifies those without tasks |
-| `list_accounts_by_tpid` | Find accounts by MS Top Parent ID |
-| `get_task_status_options` | Retrieve valid task status/statuscode options from metadata |
+---
 
-### Visualization Tools
+## Prerequisites (in detail)
 
-| Tool | Description |
-|---|---|
-| `view_milestone_timeline` | Timeline-friendly milestone events with render hints |
-| `view_opportunity_cost_trend` | Monthly cost/consumption trend with chart render hints |
-| `view_staged_changes_diff` | Before/after diff table from staged write payloads |
+| Tool | Why | Install |
+|------|-----|---------|
+| Node 20+ | Runtime | https://nodejs.org |
+| Azure CLI | Token broker for CRM auth | `winget install Microsoft.AzureCLI` |
+| GitHub CLI (`gh`) | Auto-creates your private logs repo | `winget install GitHub.cli` |
+| Git | Pushing reports | `winget install Git.Git` |
+| `MSFT-AzVPN-Manual` | Corporate VPN (P2S, cert auth — dials unattended) | Settings → Network → VPN |
 
-### Write Tools (Staged)
+> **Why this VPN specifically?** Only `MSFT-AzVPN-Manual` (Azure Point-to-Site, cert auth) can dial without an interactive MFA prompt, which the scheduled task needs. `MSFTVPN-Manual` (EAP/MFA) won't work for unattended runs.
 
-All write tools **stage** the operation and return a preview. Nothing is written to CRM until approved.
-
-| Tool | Description |
-|---|---|
-| `create_milestone` | Create a milestone linked to an opportunity |
-| `create_task` | Create a task linked to a milestone |
-| `update_task` | Update task fields (subject, due date, description, status) |
-| `close_task` | Close a task via CloseTask action |
-| `update_milestone` | Update milestone fields (date, monthly use, comments) |
-
-### Approval Queue Tools
-
-| Tool | Description |
-|---|---|
-| `list_pending_operations` | Show all staged changes awaiting approval |
-| `execute_operation` | Execute a single staged operation by ID |
-| `execute_all` | Execute all pending operations in sequence |
-| `cancel_operation` | Discard a staged operation by ID |
-| `cancel_all` | Discard all pending operations |
-
-## Testing the Server
-
-### Verify Authentication
-
-Start with the simplest operation — confirm CRM connectivity:
-
-```
-You: "Check my CRM connection"
-→ Copilot calls crm_whoami / crm_auth_status
-→ Returns your UserId, BusinessUnitId, OrganizationId
-```
-
-If this fails, verify:
-1. `az login` is current (`az account show`)
-2. Your account has Dynamics 365 access
-3. The `MSX_CRM_URL` and `MSX_TENANT_ID` are correct
-
-### Basic Read Flow
-
-```
-You: "What opportunities do I own?"
-→ Copilot calls get_my_active_opportunities
-→ Returns your owned + deal-team opportunities
-
-You: "Show milestones for opportunity <name or keyword>"
-→ Copilot resolves the opportunity, calls get_milestones(opportunityId: ...)
-→ Returns milestones with status, dates, workload
-
-You: "Which of my milestones are missing tasks?"
-→ Copilot calls find_milestones_needing_tasks with your customer keywords
-→ Returns milestones that have no linked tasks
-```
-
-### Write Flow (Stage → Review → Execute)
-
-```
-You: "Update milestone 7-503362186 date to 2026-04-15"
-→ Copilot calls update_milestone → stages the change, returns preview:
-  "Staged OP-1: msp_milestonedate 2026-03-20 → 2026-04-15"
-
-You: "Looks good, execute it"
-→ Copilot calls execute_operation(id: "OP-1")
-→ PATCH sent to CRM → "Done! Milestone date updated."
-```
-
-### Batch Write Flow
-
-```
-You: "Push all my Q1 milestones to April 15"
-→ Copilot stages multiple operations (OP-1, OP-2, OP-3...)
-→ Shows summary of all staged changes
-
-You: "Execute all"
-→ Copilot calls execute_all → executes sequentially
-→ "All 3 milestones updated."
-```
-
-### Cancel Flow
-
-```
-You: "Actually, cancel that"
-→ Copilot calls cancel_operation(id: "OP-1") or cancel_all
-→ "Cancelled. No changes made."
-```
-
-## Sample Copilot Prompts
-
-These prompts exercise the full tool surface — good for end-to-end testing:
-
-### Identity & Auth
-```
-Who am I in CRM?
-Check my CRM authentication status.
-```
-
-### Discovery & Exploration
-```
-List my active opportunities.
-Show opportunities for customer "Contoso".
-Find accounts by TPID 12345.
-What are the valid task status codes?
-```
-
-### Milestone Workflows
-```
-Show all milestones for opportunity <GUID>.
-Show my active milestones with keyword "Azure".
-Which milestones for "Contoso" are missing tasks?
-Show me a timeline of my milestones this quarter.
-```
-
-### Task Workflows
-```
-Create a task "Architecture Design Session" on milestone <GUID>.
-Update task <GUID> due date to 2026-04-30.
-Close task <GUID> as completed.
-```
-
-### Approval Queue
-```
-Show pending operations.
-Execute OP-1.
-Execute all pending operations.
-Cancel OP-2.
-Cancel all pending operations.
-```
-
-### Visualization
-```
-Show cost trend for opportunity <GUID>.
-Show a diff of the staged changes.
-```
-
-## Copilot Instructions (Optional)
-
-For the best experience, add a `copilot-instructions.md` to your repo's `.github/` directory. This teaches Copilot how to use the MCP tools effectively:
-
-```markdown
-# Copilot Instructions for MSX CRM MCP
-
-## Default Behavior
-- Prefer MCP tools over local scripts — use `msx-crm` from `.vscode/mcp.json` for all CRM operations.
-- If an MCP tool fails, retry with corrected parameters first.
-- Derive missing identifiers via MCP read tools (e.g., `crm_whoami`) — do not create ad-hoc scripts.
-
-## CRM Query Discipline
-- Never guess property names — verify via `crm_query` or `get_task_status_options`.
-- Use `crm_query` with `$filter`, `$select`, `$top` for targeted lookups.
-- Prefer `get_milestones` with a specific `opportunityId` over unfiltered `mine: true` for large datasets.
-
-## Write Safety
-- All write operations (create_task, update_task, close_task, update_milestone) are staged first.
-- Always show the user the staged preview before executing.
-- Use `execute_operation` for single approvals, `execute_all` for batch.
-- Never auto-execute staged operations without user confirmation.
-
-## Response Style
-- Keep outputs concise and action-oriented.
-- When showing milestones or opportunities, format as readable tables.
-- For writes, always show the before → after diff.
-```
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  AI Agent (GitHub Copilot / any MCP client)     │
-│                                                 │
-│  "Update milestone 7-503362186 to April 15"     │
-└────────────────┬────────────────────────────────┘
-                 │ stdio (JSON-RPC)
-┌────────────────▼────────────────────────────────┐
-│  MCP Server  (index.js)                         │
-│                                                 │
-│  ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
-│  │ tools.js │ │ crm.js   │ │ approval-queue.js│ │
-│  │          │ │          │ │                  │ │
-│  │ 22 tools │→│ OData    │ │ Stage → Review   │ │
-│  │ (read +  │ │ + retry  │ │ → Execute/Cancel │ │
-│  │  write)  │ │ + paging │ │ (EventEmitter)   │ │
-│  └──────────┘ └────┬─────┘ └──────────────────┘ │
-│                    │                            │
-│  ┌──────────┐ ┌────▼─────┐                      │
-│  │validation│ │ auth.js  │                      │
-│  │  .js     │ │ Azure CLI│                      │
-│  └──────────┘ └──────────┘                      │
-└────────────────┬────────────────────────────────┘
-                 │ HTTPS (OData v9.2)
-┌────────────────▼────────────────────────────────┐
-│  Dynamics 365 / MSX CRM                         │
-│  microsoftsales.crm.dynamics.com                │
-└─────────────────────────────────────────────────┘
+                    ┌──────────────────────────────┐
+                    │  Windows Task Scheduler      │
+                    │  (4:15 PM weekdays,          │
+                    │   WakeToRun=true)            │
+                    └──────────────┬───────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │  scheduled-run.cmd           │
+                    │  - rasdial MSFT-AzVPN-Manual │
+                    │  - node catchup.js           │
+                    │  - node post-run-summary.js  │
+                    │  - rasdial /disconnect       │
+                    └──────────────┬───────────────┘
+                                   │
+            ┌──────────────────────┼─────────────────────────┐
+            ▼                      ▼                         ▼
+     ┌────────────┐         ┌────────────┐          ┌────────────────┐
+     │ MS Graph   │         │ WorkIQ MCP │          │ MSX CRM MCP    │
+     │ (calendar) │         │ (classify) │          │ (read + write) │
+     └────────────┘         └────────────┘          └────────────────┘
+                                                            │
+                                                            ▼
+                                                    ┌──────────────┐
+                                                    │ <you>/       │
+                                                    │ activity-    │
+                                                    │ sync-logs    │
+                                                    │ (private GH) │
+                                                    └──────────────┘
 ```
 
-### Module Overview
+**Per-user state** lives in `%USERPROFILE%\.activity-sync\`:
 
-| File | Purpose |
-|---|---|
-| `src/index.js` | Entry point — creates McpServer, wires auth → CRM client → tools, connects stdio transport |
-| `src/tools.js` | All 22 MCP tool definitions with input validation, OData query construction, and approval queue integration |
-| `src/crm.js` | HTTP client for Dynamics 365 OData API — retry logic, pagination (with configurable ceiling), token management |
-| `src/auth.js` | Azure CLI token acquisition (`az account get-access-token`) with caching and expiry detection |
-| `src/validation.js` | GUID normalization, TPID validation, OData string sanitization |
-| `src/approval-queue.js` | EventEmitter-based queue for staged write operations with TTL expiry (10 min default) |
-| `src/audit.js` | Structured NDJSON audit logger — emits tool invocations, entity sets, record counts, and blocked requests to stderr |
-
-## Running Tests
-
-```bash
-cd mcp-server
-npm test            # single run
-npm run test:watch  # watch mode
+```
+.activity-sync\
+  catchup.js              # decides which dates to sync
+  scheduled-run.cmd       # entry point (VPN + sync + publish)
+  config.env              # REPO_PATH, VPN_NAME, NODE_EXE
+  last-run-date.txt       # high-water mark
+  scheduled-run.log       # rolling stdout/stderr
+  reports-repo\           # local clone of your private logs repo
 ```
 
-## Data Governance
+Nothing is hardcoded to one user — every path is resolved from `%USERPROFILE%` or `config.env`.
 
-### Entity Allowlist
+---
 
-`crm_query` and `crm_get_record` only accept entity sets declared in `ALLOWED_ENTITY_SETS` (defined in `src/tools.js`). Queries to unlisted entities are rejected with a descriptive error. The current allowlist:
+## How runs reach GitHub
 
-| Entity Set | Purpose |
-|---|---|
-| `accounts` | Account lookup and TPID resolution |
-| `contacts` | Contact lookup |
-| `opportunities` | Pipeline and deal state |
-| `msp_engagementmilestones` | Milestone tracking |
-| `msp_dealteams` | Deal team membership |
-| `msp_workloads` | Workload lookup |
-| `tasks` | Task/activity records |
-| `systemusers` | User identity resolution |
-| `transactioncurrencies` | Currency lookup for milestones |
-| `connections` | Deal team / partner linkage (alternative to `msp_dealteams` in some orgs) |
-| `connectionroles` | Connection role names (companion to `connections`) |
-| `processstages` | BPF stage name resolution for MCEM stage identification |
-| `EntityDefinitions` | Metadata queries (e.g., status option sets) |
+After each sync, [tools/post-run-summary.js](tools/post-run-summary.js):
 
-To add an entity, update the `ALLOWED_ENTITY_SETS` set in `src/tools.js`. Purpose-built tools (e.g., `get_milestones`, `list_opportunities`) bypass the allowlist because they already constrain scope through hard-coded entity paths and field selections.
+1. Picks the most recent `reports/sync_*.md` from the source repo
+2. Copies it into `<state>\reports-repo\reports\`
+3. Regenerates `README.md` with metrics (created, closed, failed counts) from the latest run
+4. `git commit && git push` to your private `activity-sync-logs` repo
 
-### Pagination Ceiling
+The push is best-effort — a network blip won't fail the sync. Your `README.md` is overwritten on every run so it always reflects the latest status; the `reports/` folder accumulates history.
 
-`crm_query` caps auto-pagination at **500 records** (`CRM_QUERY_MAX_RECORDS` in `src/tools.js`). The `$top` parameter is also capped to this value. If more records exist, the response includes `truncated: true`. Purpose-built tools are not subject to this limit.
+---
 
-### Audit Logging
+## Day-to-day usage
 
-Every `crm_query` and `crm_get_record` invocation emits a structured NDJSON record to **stderr** (separate from MCP's stdio transport on stdout). Each record includes:
+```powershell
+# Run on demand
+schtasks /Run /TN ActivitySync-DailyRun
 
-```json
-{"ts": "2026-03-09T...", "tool": "crm_query", "entitySet": "accounts", "params": {"filter": "...", "select": "..."}, "recordCount": 12}
+# Tail the live log
+Get-Content "$env:USERPROFILE\.activity-sync\scheduled-run.log" -Tail 30 -Wait
+
+# View past runs
+start https://github.com/<you>/activity-sync-logs
+
+# Run a specific date range manually (no schedule, no publish)
+node src/agent/cli.js sync --from 2026-05-01 --to 2026-05-06
 ```
 
-Blocked requests include `"blocked": true` and a `"reason"` field. To capture audit logs, redirect stderr:
+### Pause / resume the schedule
 
-```bash
-node src/index.js 2>> /path/to/audit.ndjson
+```powershell
+schtasks /Change /TN ActivitySync-DailyRun /DISABLE
+schtasks /Change /TN ActivitySync-DailyRun /ENABLE
 ```
 
-## See Also
+### Uninstall
 
-Check out [microsoft/mcaps-copilot-tools](https://github.com/microsoft/mcaps-copilot-tools) for a demo of this MCP server being used in practice.
+```powershell
+schtasks /Delete /TN ActivitySync-DailyRun /F
+Remove-Item "$env:USERPROFILE\.activity-sync" -Recurse -Force
+```
 
-## License
+---
 
-MIT
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `rasdial` returns non-zero | VPN profile missing or wrong name | Add `MSFT-AzVPN-Manual` from corp portal, or pass `-VpnName` |
+| CRM returns 401 / IP block | VPN didn't connect | Check `scheduled-run.log` for the `rasdial` output |
+| `az` token timeout | Corporate proxy slow | Already bumped to 90s in `src/auth.js`; further bump if needed |
+| WorkIQ classification fails | Service hiccup | Sync still completes via fallback classifier; check next run |
+| Schedule didn't fire overnight | Laptop was on battery | `StopIfGoingOnBatteries=false` is set; verify with `schtasks /Query /TN ActivitySync-DailyRun /XML` |
+| Push to logs repo fails | `gh auth` expired | Run `gh auth login` |
+
+Everything is in `%USERPROFILE%\.activity-sync\scheduled-run.log` — start there.
+
+---
+
+## Files at a glance
+
+| Path | What it is |
+|------|------------|
+| [install/setup.ps1](install/setup.ps1) | One-command onboarding |
+| [install/templates/scheduled-run.cmd](install/templates/scheduled-run.cmd) | Portable scheduled-task entry point |
+| [install/templates/catchup.js](install/templates/catchup.js) | Decides which dates to sync, runs them |
+| [src/agent/sync.js](src/agent/sync.js) | Core sync engine (calendar → classify → CRM ops) |
+| [src/agent/classifier.js](src/agent/classifier.js) | LLM classifier (WorkIQ + fallback) |
+| [src/agent/cli.js](src/agent/cli.js) | Manual CLI (`sync`, `auth`, etc.) |
+| [tools/post-run-summary.js](tools/post-run-summary.js) | Publishes report → private GH repo |
+| [reports/](reports/) | Local run history (gitignored in this repo) |
+
+---
+
+## Related
+
+- The MCP servers this agent depends on (MSX CRM, WorkIQ): [docs/MCP_SERVER.md](docs/MCP_SERVER.md).
+- Architecture notes for the MCP server itself: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

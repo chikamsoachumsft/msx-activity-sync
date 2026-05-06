@@ -5,6 +5,14 @@ import { z } from 'zod';
 import { isValidGuid, normalizeGuid, isValidTpid, sanitizeODataString } from './validation.js';
 import { getApprovalQueue } from './approval-queue.js';
 import { auditLog } from './audit.js';
+import {
+  getMe as teamsGetMe,
+  resolveUser as teamsResolveUser,
+  getOrCreateOneOnOneChat,
+  createGroupChat,
+  sendChatMessage,
+  sendChannelMessage
+} from './teams.js';
 
 // ── Entity allowlist ─────────────────────────────────────────
 // Only these Dynamics 365 entity sets may be queried via crm_query
@@ -788,10 +796,15 @@ export function registerTools(server, crmClient) {
         }))
       ];
 
-      // 5. Filter by customerKeyword
+      // 5. Filter by customerKeyword (fuzzy: strip spaces to handle names like "A G C O")
       if (customerKeyword) {
-        const kw = customerKeyword.toLowerCase();
-        opportunities = opportunities.filter(o => (o.customer || '').toLowerCase().includes(kw));
+        const kw = customerKeyword.toLowerCase().replace(/\s+/g, '');
+        opportunities = opportunities.filter(o => {
+          const customer = (o.customer || '').toLowerCase();
+          const oppName = (o.name || '').toLowerCase();
+          return customer.includes(kw) || customer.replace(/\s+/g, '').includes(kw)
+            || oppName.includes(kw) || oppName.replace(/\s+/g, '').includes(kw);
+        });
       }
 
       return text({ count: opportunities.length, opportunities });
@@ -1910,6 +1923,164 @@ export function registerTools(server, crmClient) {
         businessUnitId: authResult.data?.BusinessUnitId,
         organizationId: authResult.data?.OrganizationId
       });
+    }
+  );
+
+  // ── Teams: tenant resolution helper ────────────────────────
+  const tenantId = process.env.MSX_TENANT_ID || '72f988bf-86f1-41af-91ab-2d7cd011db47';
+
+  // ── find_teams_user ────────────────────────────────────────
+  server.tool(
+    'find_teams_user',
+    'Resolve a Teams/AAD user by UPN, email, or object ID via Microsoft Graph. Returns id, displayName, userPrincipalName, mail.',
+    {
+      identifier: z.string().describe('UPN (alice@contoso.com), email, or AAD object GUID')
+    },
+    async ({ identifier }) => {
+      try {
+        const user = await teamsResolveUser(identifier, { tenantId });
+        return text({
+          id: user.id,
+          displayName: user.displayName,
+          userPrincipalName: user.userPrincipalName,
+          mail: user.mail
+        });
+      } catch (e) {
+        return error(e.message);
+      }
+    }
+  );
+
+  // ── send_teams_message ─────────────────────────────────────
+  server.tool(
+    'send_teams_message',
+    'Send a Teams message. Modes: (1) 1:1 chat — provide `recipient` (UPN/email/GUID); (2) group chat — provide `recipients[]` (>=2 UPNs/emails/GUIDs); (3) existing chat — provide `chatId`; (4) channel — provide both `teamId` and `channelId`. Requires `confirm: true` to actually send (otherwise returns a preview). Uses delegated Microsoft Graph (acts as the signed-in az user).',
+    {
+      recipient: z.string().optional().describe('Single recipient UPN/email/GUID for a 1:1 chat'),
+      recipients: z.array(z.string()).optional().describe('Multiple recipients (>=2) for a new group chat'),
+      chatId: z.string().optional().describe('Existing Teams chat ID to post into'),
+      teamId: z.string().optional().describe('Team ID (for channel messages)'),
+      channelId: z.string().optional().describe('Channel ID (for channel messages)'),
+      message: z.string().describe('Message body (plain text unless `html: true`)'),
+      html: z.boolean().optional().describe('Treat `message` as HTML content'),
+      subject: z.string().optional().describe('Optional subject line'),
+      importance: z.enum(['normal', 'high', 'urgent']).optional().describe('Message importance'),
+      topic: z.string().optional().describe('Topic for newly created group chat'),
+      confirm: z.boolean().optional().describe('Set true to actually send. Without it, returns a preview only.')
+    },
+    async (args) => {
+      const { recipient, recipients, chatId, teamId, channelId, message, html, subject, importance, topic, confirm } = args;
+
+      if (!message || !message.trim()) return error('message is required');
+
+      // Determine target mode
+      const modes = [
+        chatId ? 'chat' : null,
+        (teamId && channelId) ? 'channel' : null,
+        recipient ? 'oneOnOne' : null,
+        (recipients && recipients.length) ? 'group' : null
+      ].filter(Boolean);
+      if (modes.length === 0) {
+        return error('Provide one of: `chatId`, `teamId`+`channelId`, `recipient`, or `recipients[]`.');
+      }
+      if (modes.length > 1) {
+        return error(`Conflicting targets specified: ${modes.join(', ')}. Provide exactly one.`);
+      }
+      const mode = modes[0];
+
+      try {
+        // Resolve recipients to AAD user objects for preview / chat creation
+        let resolvedRecipients = [];
+        if (mode === 'oneOnOne') {
+          resolvedRecipients = [await teamsResolveUser(recipient, { tenantId })];
+        } else if (mode === 'group') {
+          if (recipients.length < 2) return error('Group chats require at least 2 recipients (in addition to you).');
+          resolvedRecipients = await Promise.all(
+            recipients.map((id) => teamsResolveUser(id, { tenantId }))
+          );
+        }
+
+        const preview = {
+          mode,
+          recipients: resolvedRecipients.map((u) => ({
+            id: u.id,
+            displayName: u.displayName,
+            userPrincipalName: u.userPrincipalName
+          })),
+          chatId: chatId || undefined,
+          teamId: teamId || undefined,
+          channelId: channelId || undefined,
+          subject,
+          importance: importance || 'normal',
+          contentType: html ? 'html' : 'text',
+          messagePreview: message.length > 280 ? message.slice(0, 280) + '…' : message
+        };
+
+        if (!confirm) {
+          return text({
+            staged: false,
+            sent: false,
+            preview,
+            message: 'Preview only — re-call with `confirm: true` to actually send the Teams message.'
+          });
+        }
+
+        // Resolve / create the chat as needed
+        let targetChatId = chatId;
+        if (mode === 'oneOnOne') {
+          const chat = await getOrCreateOneOnOneChat(resolvedRecipients[0].id, { tenantId });
+          targetChatId = chat.id;
+        } else if (mode === 'group') {
+          const chat = await createGroupChat(
+            resolvedRecipients.map((u) => u.id),
+            { topic, tenantId }
+          );
+          targetChatId = chat.id;
+        }
+
+        // Send
+        let sent;
+        if (mode === 'channel') {
+          sent = await sendChannelMessage(teamId, channelId, {
+            text: html ? undefined : message,
+            html: html ? message : undefined,
+            subject,
+            importance,
+            tenantId
+          });
+        } else {
+          sent = await sendChatMessage(targetChatId, {
+            text: html ? undefined : message,
+            html: html ? message : undefined,
+            subject,
+            importance,
+            tenantId
+          });
+        }
+
+        auditLog({
+          tool: 'send_teams_message',
+          mode,
+          chatId: targetChatId,
+          teamId,
+          channelId,
+          recipientIds: resolvedRecipients.map((u) => u.id),
+          messageId: sent?.id
+        });
+
+        return text({
+          sent: true,
+          mode,
+          chatId: targetChatId,
+          teamId,
+          channelId,
+          messageId: sent?.id,
+          webUrl: sent?.webUrl,
+          recipients: preview.recipients
+        });
+      } catch (e) {
+        return error(`send_teams_message failed: ${e.message}`);
+      }
     }
   );
 }
