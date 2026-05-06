@@ -76,6 +76,11 @@ const badge = Number(failed) > 0
   ? '![status](https://img.shields.io/badge/last%20run-failed-red)'
   : '![status](https://img.shields.io/badge/last%20run-success-brightgreen)';
 
+// Detect "needs attention" so the commit subject leads with [ACTION REQUIRED]
+// (visible in GitHub mobile app push notifications).
+const actionable = Number(failed) + Number(followUp);
+const needsAction = actionable > 0;
+
 // 4. Build README.md
 const reportLink = `./reports/${latestName}`;
 const readme = `# Activity Sync Logs
@@ -120,7 +125,7 @@ try {
   // Only commit if there are staged changes
   try { sh('git diff --cached --quiet'); console.log('[summary] No changes — nothing to commit.'); process.exit(0); }
   catch { /* there are changes */ }
-  sh(`git commit -m "sync ${ts || new Date().toISOString()}: ${status} (${created} created, ${failed} failed)"`);
+  sh(`git commit -m "${needsAction ? '[ACTION REQUIRED] ' : ''}sync ${ts || new Date().toISOString()}: ${status} (${created} created, ${failed} failed${needsAction ? `, ${actionable} need attention` : ''})"`);
   sh('git push --quiet');
   console.log('[summary] Pushed to reports-repo.');
 } catch (err) {

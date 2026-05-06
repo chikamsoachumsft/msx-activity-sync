@@ -47,6 +47,12 @@ if exist "%STATE_DIR%\reports-repo\.git" (
   "%NODE_EXE%" "%REPO_PATH%\tools\post-run-summary.js" >> "%LOG%" 2>&1
 )
 
+rem --- Notify if action required (best effort, never fails the run) ---
+if exist "%REPO_PATH%\tools\notify.ps1" (
+  echo [notify] Checking for action items... >> "%LOG%"
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO_PATH%\tools\notify.ps1" -ReportsDir "%REPO_PATH%\reports" >> "%LOG%" 2>&1
+)
+
 rem --- Disconnect VPN only if we dialed it ---
 if %VPN_DIALED%==1 (
   echo [vpn] Disconnecting %VPN_NAME%... >> "%LOG%"

@@ -110,6 +110,20 @@ if (-not (Test-Path (Join-Path $StateDir "last-run-date.txt"))) {
 }
 Ok "State staged at $StateDir"
 
+# ─── 5b. Toast notification module (best effort) ───────────────────────
+Step "Installing BurntToast (notification module, optional)"
+if (Get-Module -ListAvailable -Name BurntToast) {
+  Ok "BurntToast already installed"
+} else {
+  try {
+    Install-Module -Name BurntToast -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop 2>&1 | Out-Null
+    Ok "BurntToast installed (toasts will include 'Open report' button)"
+  } catch {
+    Warn "Could not install BurntToast: $($_.Exception.Message)"
+    Warn "Notifications will fall back to native WinRT toasts (still works, less rich)"
+  }
+}
+
 # ─── 6. Logs repo (optional) ───────────────────────────────────────────
 if ($NoLogsRepo) {
   Warn "Skipping logs repo (NoLogsRepo flag). Reports stay in $RepoRoot\reports\"

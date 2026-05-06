@@ -8,8 +8,7 @@
 - 🤖 **Smart matching.** An LLM classifier (WorkIQ MCP) maps meeting subjects/attendees to the correct opportunity + milestone. Falls back gracefully if the model is unavailable.
 - ⏰ **Runs unattended.** Windows Task Scheduler fires it at 4:15 PM on weekdays, wakes the laptop if asleep, dials the VPN automatically, runs even on battery.
 - 🔁 **Catches up missed days.** Out sick? Plane mode? The next run backfills weekdays you missed.
-- �️ **Won't double-log.** Before creating a task, the agent checks CRM for any existing task on the same milestone that day — including ones you logged manually — and skips. Duplicates are surfaced in the report and the live log so you can verify.
-- �📊 **Personal log archive.** Every run pushes a markdown report + auto-updated README to your own private GitHub repo so you can see what got synced.
+- �️ **Won't double-log.** Before creating a task, the agent checks CRM for any existing task on the same milestone that day — including ones you logged manually — and skips. Duplicates are surfaced in the report and the live log so you can verify.- 🔔 **Notifies you when input is needed.** A persistent Windows toast pops up after each run if anything needs your attention (failures, follow-ups, ambiguous customer matches). The notification stays in Action Center until you dismiss it.- �📊 **Personal log archive.** Every run pushes a markdown report + auto-updated README to your own private GitHub repo so you can see what got synced.
 - 🔒 **No secrets stored.** Auth via `az login` + Windows VPN profile. You own the data, the logs, and the schedule.
 
 ---
